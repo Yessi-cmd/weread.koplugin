@@ -1,7 +1,7 @@
 -- Pure bookshelf ordering and filtering.
 --
 -- Only keys are handled here; the translated labels for each sort/filter option
--- live in the view (lib/shelf.lua) so this module stays free of KOReader and
+-- live in the view (ui/shelf.lua) so this module stays free of KOReader and
 -- i18n dependencies and can be unit-tested with a plain Lua interpreter.
 -- See spec/shelf_sort_spec.lua.
 

@@ -2,7 +2,7 @@
 -- marks baked into the cached EPUB, and turning a tap on an underline into a
 -- thought popup.
 --
--- Download and embedding happen elsewhere (lib/downloader.lua → lib/thoughts.lua
+-- Download and embedding happen elsewhere (ui/downloader.lua → lib/thoughts.lua
 -- → lib/annotations.lua); by the time this module runs, the EPUB already carries
 -- .wr-underline spans and #wrthought-… anchors. See
 -- docs/weread-annotations-flow.md for the whole pipeline.
@@ -59,10 +59,10 @@ local function thought_perf(stage, started, ...)
         "ms=", string.format("%.1f", elapsed), ...)
 end
 
-local AnnotationsUI = {}
-AnnotationsUI.__index = AnnotationsUI
+local ReaderAnnotations = {}
+ReaderAnnotations.__index = ReaderAnnotations
 
-function AnnotationsUI:new(plugin)
+function ReaderAnnotations:new(plugin)
     return setmetatable({
         plugin = plugin,
         settings = plugin.settings,
@@ -72,14 +72,14 @@ function AnnotationsUI:new(plugin)
 end
 
 -- Whether the user wants underlines and thoughts shown (the default).
-function AnnotationsUI:isVisible()
+function ReaderAnnotations:isVisible()
     return self.settings:get("cache").show_annotations ~= false
 end
 
 -- Apply the initial hidden state before KOReader renders the document. Doing
 -- this from onReaderReady starts partial rerendering; its seamless reload then
 -- creates a new plugin instance and repeats the same rerender forever.
-function AnnotationsUI:applyInitialVisibility()
+function ReaderAnnotations:applyInitialVisibility()
     local ui = self.plugin.ui
     if not ui or not ui.document or not self.plugin:detectWeReadBook() then
         return
@@ -108,7 +108,7 @@ end
 -- Reapply the current annotation visibility preference to the open WeRead book.
 -- Show=true reapplies the base stylesheet + user tweaks (revealing baked-in
 -- underlines); show=false appends ANNOTATION_HIDE_CSS on top. Triggers a reflow.
-function AnnotationsUI:applyVisibility()
+function ReaderAnnotations:applyVisibility()
     local ui = self.plugin.ui
     if not ui or not ui.document then
         return
@@ -140,7 +140,7 @@ function AnnotationsUI:applyVisibility()
 end
 
 -- Close a popup that is on screen, e.g. right after the user hides annotations.
-function AnnotationsUI:closePopup()
+function ReaderAnnotations:closePopup()
     ThoughtPopup.closeVisible()
     self._thought_popup_open = nil
 end
@@ -152,7 +152,7 @@ end
 -- makes ReaderLink's tap_link handler find no link and decline, so the tap falls
 -- through to KOReader's native page-turn (honoring the user's tap zones / RTL).
 -- Only our own anchors are hidden, and only while annotations are off.
-function AnnotationsUI:_installLinkFilter()
+function ReaderAnnotations:_installLinkFilter()
     local ui = self.plugin.ui
     if not ui or not ui.link or self._orig_getLinkFromGes then
         return
@@ -171,7 +171,7 @@ function AnnotationsUI:_installLinkFilter()
     end
 end
 
-function AnnotationsUI:_removeLinkFilter()
+function ReaderAnnotations:_removeLinkFilter()
     local ui = self.plugin.ui
     if self._orig_getLinkFromGes and ui and ui.link then
         ui.link.getLinkFromGes = self._orig_getLinkFromGes
@@ -179,7 +179,7 @@ function AnnotationsUI:_removeLinkFilter()
     self._orig_getLinkFromGes = nil
 end
 
-function AnnotationsUI:_teardownThoughtInterception()
+function ReaderAnnotations:_teardownThoughtInterception()
     local ui = self.plugin.ui
     if self._thought_interception_setup and ui then
         ui:unRegisterTouchZones({
@@ -200,7 +200,7 @@ function AnnotationsUI:_teardownThoughtInterception()
     self._current_weread_book_id = nil
 end
 
-function AnnotationsUI:_setupThoughtInterception()
+function ReaderAnnotations:_setupThoughtInterception()
     local Device = require("device")
     if not Device:isTouchDevice() then
         return
@@ -227,7 +227,7 @@ end
 
 -- Start a new reader session: invalidate anything scheduled by the previous one
 -- and set up tap interception when the new document is a WeRead book.
-function AnnotationsUI:onReaderReady(weread_book_id)
+function ReaderAnnotations:onReaderReady(weread_book_id)
     self._reader_session_gen = (self._reader_session_gen or 0) + 1
     self:_teardownThoughtInterception()
 
@@ -266,12 +266,12 @@ function AnnotationsUI:onReaderReady(weread_book_id)
     end)
 end
 
-function AnnotationsUI:onCloseDocument()
+function ReaderAnnotations:onCloseDocument()
     self._reader_session_gen = (self._reader_session_gen or 0) + 1
     self:_teardownThoughtInterception()
 end
 
-function AnnotationsUI:_clearThoughtHighlight(document)
+function ReaderAnnotations:_clearThoughtHighlight(document)
     if not self._thought_highlight_active then
         return
     end
@@ -282,7 +282,7 @@ function AnnotationsUI:_clearThoughtHighlight(document)
     UIManager:setDirty(self.plugin.dialog, "ui")
 end
 
-function AnnotationsUI:_getThoughtPopupLayoutParams()
+function ReaderAnnotations:_getThoughtPopupLayoutParams()
     local ui = self.plugin.ui
     if not ui or not ui.document then
         return nil
@@ -314,7 +314,7 @@ function AnnotationsUI:_getThoughtPopupLayoutParams()
     }
 end
 
-function AnnotationsUI:_showThoughtPopup(html, link, session_gen, tap_started)
+function ReaderAnnotations:_showThoughtPopup(html, link, session_gen, tap_started)
     local show_started = time.now()
     if session_gen and session_gen ~= self._reader_session_gen then
         self._thought_popup_open = nil
@@ -408,7 +408,7 @@ end
 -- The link's shape differs between engines and even between tap locations inside
 -- the same anchor (tapping the star vs the underlined text can expose the href
 -- under a different field), so scan common fields first, then a shallow crawl.
-function AnnotationsUI:_linkHref(link)
+function ReaderAnnotations:_linkHref(link)
     local seen = {}
     local function extract(value, depth)
         if depth > 4 or value == nil then
@@ -442,7 +442,7 @@ end
 -- Parse "#wrthought-<book>-<chapter>-<start>-<end>" into its parts. The last two
 -- segments are numeric (range start/end); book/chapter must not contain dashes
 -- (true for WeRead IDs in practice).
-function AnnotationsUI:_parseThoughtHref(href)
+function ReaderAnnotations:_parseThoughtHref(href)
     if type(href) ~= "string" then
         return nil
     end
@@ -466,7 +466,7 @@ end
 -- Load a chapter's cached thoughts, memoized per (book, chapter) so tapping
 -- different underlines in the same chapter reads/decodes the JSON only once.
 -- Returns the decoded reviews array, or false if the chapter has no cache.
-function AnnotationsUI:_loadThoughtReviews(book_id, chapter_uid)
+function ReaderAnnotations:_loadThoughtReviews(book_id, chapter_uid)
     self._thought_json_cache = self._thought_json_cache or {}
     local key = tostring(book_id) .. ":" .. tostring(chapter_uid)
     local cached = self._thought_json_cache[key]
@@ -487,7 +487,7 @@ function AnnotationsUI:_loadThoughtReviews(book_id, chapter_uid)
 end
 
 -- Load the chapter's cached thoughts, match the tapped range, render popup HTML.
-function AnnotationsUI:_buildThoughtHtmlFromHref(href)
+function ReaderAnnotations:_buildThoughtHtmlFromHref(href)
     local info = self:_parseThoughtHref(href)
     if not info then
         return nil
@@ -527,7 +527,7 @@ function AnnotationsUI:_buildThoughtHtmlFromHref(href)
     return nil
 end
 
-function AnnotationsUI:_onThoughtTap(ges)
+function ReaderAnnotations:_onThoughtTap(ges)
     local tap_started = time.now()
     local ui = self.plugin.ui
     if not ui or not ui.document or not ui.link then
@@ -614,4 +614,4 @@ function AnnotationsUI:_onThoughtTap(ges)
     return true
 end
 
-return AnnotationsUI
+return ReaderAnnotations

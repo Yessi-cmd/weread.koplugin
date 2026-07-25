@@ -3,26 +3,29 @@ local logger = require("logger")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 
-local Account = require("lib.account")
-local AnnotationsUI = require("lib.annotations_ui")
+-- Headless layer: protocol, data and pure logic. Nothing here knows about UI.
 local BookIndex = require("lib.book_index")
-local CacheAdmin = require("lib.cache_admin")
-local Chapters = require("lib.chapters")
 local Client = require("lib.client")
 local Content = require("lib.content")
-local Downloader = require("lib.downloader")
 local I18n = require("lib.i18n")
-local MPArticles = require("lib.mp_articles")
-local PluginMenu = require("ui.menu")
-local ProgressSync = require("lib.progress_sync")
-local QRLogin = require("lib.qr_login")
 local ReadReport = require("lib.read_report")
-local ReportUI = require("lib.report_ui")
 local Settings = require("lib.settings")
-local Shelf = require("lib.shelf")
-local UIHost = require("lib.ui_host")
 local Util = require("lib.util")
+
+-- UI layer: controllers driving the KOReader widgets, and the menu tree.
+local Account = require("ui.account")
+local CacheAdmin = require("ui.cache_admin")
+local Chapters = require("ui.chapters")
+local Downloader = require("ui.downloader")
+local MPArticles = require("ui.mp_articles")
+local PluginMenu = require("ui.menu")
+local ProgressSync = require("ui.progress_sync")
+local QRLogin = require("ui.qr_login")
+local ReaderAnnotations = require("ui.reader_annotations")
+local ReportUI = require("ui.report_ui")
+local Shelf = require("ui.shelf")
 local ThoughtPopup = require("ui.thought_popup")
+local UIHost = require("ui.host")
 
 -- `_` is the translation function; never reuse it as a loop placeholder in this file.
 local function _(text)
@@ -75,7 +78,7 @@ function WeReadPlugin:init()
         end,
     }
     self.account = Account:new(self)
-    self.annotations = AnnotationsUI:new(self)
+    self.annotations = ReaderAnnotations:new(self)
     self.cache_admin = CacheAdmin:new(self)
     self.chapters = Chapters:new(self)
     self.mp_articles = MPArticles:new(self)
@@ -179,7 +182,7 @@ function WeReadPlugin:onWeReadSyncProgress()
 end
 
 -- Fires before KOReader renders the document, which is the only safe moment to
--- apply the "annotations hidden" stylesheet (see lib/annotations_ui.lua).
+-- apply the "annotations hidden" stylesheet (see ui/reader_annotations.lua).
 function WeReadPlugin:onReadSettings()
     self.annotations:applyInitialVisibility()
 end

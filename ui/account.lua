@@ -1,7 +1,7 @@
 -- WeRead account state: the login gate every online feature calls first, plus
 -- the status / renew / clear actions behind the account menu.
 --
--- The QR login protocol itself lives in lib/qr_login.lua; this module only
+-- The QR login protocol itself lives in ui/qr_login.lua; this module only
 -- decides when to start it and reports what credentials are configured.
 
 local BD = require("ui/bidi")

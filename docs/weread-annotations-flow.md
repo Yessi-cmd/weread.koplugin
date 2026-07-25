@@ -28,7 +28,7 @@
 
 ## 阶段一：下载（Download）
 
-前提：开启「下载划线和想法」（设置项 `cache.download_underlines_and_thoughts`）。在 `lib/downloader.lua` 的每章下载流程中：
+前提：开启「下载划线和想法」（设置项 `cache.download_underlines_and_thoughts`）。在 `ui/downloader.lua` 的每章下载流程中：
 
 1. **拉划线** —— `_startAnnotations` → `Thoughts.fetch_underlines`（`lib/thoughts.lua`）→ `client:get_chapter_underlines`（`lib/client.lua`）→ gateway API **`/book/underlines`**。返回该章所有划线，每条带一个 `range`，如 `"383-415"` —— 这是**原始章节 HTML 的 rune（UTF-8 字符）索引区间**。
 2. **分批拉想法** —— 收集所有 range → `build_chapter_review_batches`（`lib/client.lua`，每 5 个 range 一批）→ `_annotationBatch` 逐批 → `get_chapter_reviews_batch` → gateway API **`/book/readreviews`**。返回每个 range 上的想法 `reviews`（含作者、内容、点赞数、引用原文 `abstract`）。批次间 0.3s 间隔 + 失败重试 2 次（防限流）。
@@ -60,13 +60,13 @@
 
 ## 阶段三：阅读时展示（Display）
 
-### 打开书 `onReaderReady`（`main.lua` → `lib/annotations_ui.lua`）
+### 打开书 `onReaderReady`（`main.lua` → `ui/reader_annotations.lua`）
 
 - 检测是 WeRead 书 → `_setupThoughtInterception`：注册一个**覆盖全屏的 tap 手势区**，`overrides = {"tap_link"}` —— **抢在 KOReader 内建的脚注弹窗（tap_link）之前**接管点击。
 - `applyVisibility`：按 `show_annotations` 开关，决定是否往排版样式表追加隐藏注释的 CSS —— 这就是「显示 / 隐藏划线」开关的实现。
 - **预热** `ThoughtPopup.prewarm`（`ui/thought_popup.lua`）：用占位 HTML 提前创建一次渲染 widget，把 MuPDF 引擎 / 字体 / CSS 缓存热起来，让首次点击不卡。
 
-### 点击划线 `_onThoughtTap`（`lib/annotations_ui.lua`）
+### 点击划线 `_onThoughtTap`（`ui/reader_annotations.lua`）
 
 1. `self.ui.link:getLinkFromGes(ges)` 拿到点击处链接 —— 因为划线被 `<a href="#thought_...">` 包裹，KOReader 把它当作 link，返回 `link.xpointer`（指向目标 aside 节点）。
 2. `getHTMLFromXPointer(link.xpointer, 0x1001, false)` 提取**那一个 aside 节点**的 HTML。第三参数 `false` 很关键：不扩展到父节点，否则会把整个 footnotes section（上百条脚注）全拉出来，MuPDF 会卡死。结果按 `xpointer` 缓存。
@@ -90,9 +90,9 @@
 
 | 文件 | 职责 |
 |------|------|
-| `lib/downloader.lua` | 下载状态机，逐章调用划线/想法抓取与嵌入 |
+| `ui/downloader.lua` | 下载状态机，逐章调用划线/想法抓取与嵌入 |
 | `lib/client.lua` | gateway API：`/book/underlines`、`/book/readreviews`，range 分批 |
 | `lib/thoughts.lua` | 下载编排、想法 JSON 缓存、CSS 合并 |
 | `lib/annotations.lua` | 核心：把划线/想法注入 HTML（下划线 span + noteref 链接 + footnote aside） |
 | `ui/thought_popup.lua` | 展示：ScrollHtmlWidget 底部浮层、字体预热、单例复用 |
-| `lib/annotations_ui.lua` | tap 拦截、xpointer 提取、显隐开关、会话防错 |
+| `ui/reader_annotations.lua` | tap 拦截、xpointer 提取、显隐开关、会话防错 |

@@ -28,6 +28,24 @@ jobs:
               luajit -b "$file" /tmp/luajit-check.out
             done
 
+      - name: Unit tests
+        run: |
+          set -euo pipefail
+          for spec in spec/*_spec.lua; do
+            echo "== $spec"
+            luajit "$spec"
+          done
+
+      # lib/ is the headless layer: protocol, data and pure logic. A module that
+      # needs a KOReader widget belongs in ui/ instead, which keeps dependencies
+      # running one way (ui/ -> lib/) and keeps lib/ unit-testable.
+      - name: Layering check (lib/ must stay headless)
+        run: |
+          if rg -n 'require\("(ui/|ui\.|device)' lib/; then
+            echo "::error::lib/ must not depend on UI modules. Move the file to ui/."
+            exit 1
+          fi
+
       - name: Python syntax check
         run: |
           if [ -d scripts ]; then

@@ -2,7 +2,7 @@
 -- to talk to the user or to guard a network call, in one injected object.
 --
 -- Extracted from main.lua so controllers depend on this narrow surface instead
--- of the whole plugin. It is deliberately the exact interface lib/qr_login.lua
+-- of the whole plugin. It is deliberately the exact interface ui/qr_login.lua
 -- already expects from its `host`, so that module needs no changes.
 --
 -- Two error-reporting conventions are kept from the original code:

@@ -17,33 +17,24 @@ below onto the plugin instance, and the lifecycle handlers (`onReaderReady`,
 `onCloseDocument`, `onReadSettings`, …) delegate in one or two lines. Feature
 work belongs in a controller, not here.
 
+Two layers, split by a rule CI enforces: **anything that touches the user lives
+in `ui/`; `lib/` is headless.** No file in `lib/` may require `ui/…`,
+`ui/widget/…`, `device`, or any other KOReader UI module — if it needs to, it
+belongs in `ui/`. Dependencies therefore run one way only: `ui/ → lib/`.
+
 ```
 main.lua                Plugin entry: init wiring, Dispatcher, lifecycle handlers
 
-Feature controllers (constructed with the plugin instance; reach siblings
-through self.plugin.<name>, KOReader's ReaderUI through self.plugin.ui):
-lib/account.lua         Login gate, account status, cookie renewal, clearing
-lib/annotations_ui.lua  Underline visibility + tap-to-thought-popup, session guards
-lib/cache_admin.lua     Download dir, cache overview/cleanup, local-cache import
-lib/chapters.lua        Catalog, chapter list, open/download entry, end-of-book
-lib/downloader.lua      Book/chapter download engine (state machine + standby guard)
-lib/mp_articles.lua     Public-account article lists and article download
-lib/progress_sync.lua   Progress upload / reader-URL parsing (WIP)
-lib/qr_login.lua        QR login protocol and its dialogs
-lib/read_report.lua     Reading-report state machine, context refresh, retries
-lib/report_ui.lua       Reading-report menu + target picker, reading statistics
-lib/shelf.lua           Shelf listing, sort/filter, book details, store search
-lib/ui_host.lua         UI/network primitives every controller uses (see below)
-
-Protocol, data and pure logic:
+lib/ — protocol, data and pure logic. Headless: no UI, no KOReader widgets.
+lib/annotations.lua     Injects underlines/thoughts into chapter HTML
 lib/book_index.lua      Pure: book identification, chapter-file mapping (tested)
 lib/book_store.lua      Per-book metadata, reading-state, and article-list persistence
 lib/client.lua          HTTP client (cookie-auth Web API + Bearer-auth gateway API)
 lib/content.lua         Content decoding (e_0/e_1/e_2/e_3), EPUB/HTML generation
 lib/cookie.lua          Cookie header parsing and merging
 lib/crypto.lua          SHA-256, MD5 (pure Lua)
-lib/annotations.lua     Injects underlines/thoughts into chapter HTML
 lib/i18n.lua            Chinese translations (zh table, _() wrapper)
+lib/read_report.lua     Reading-report state machine, context refresh, retries
 lib/read_stats.lua      Reading-statistics fetch and normalization
 lib/reader_state.lua    Web Reader session and position extraction
 lib/scan.lua            Pure: local-cache scanner (tested)
@@ -54,13 +45,40 @@ lib/thoughts.lua        Underline/thought download orchestration and cache
 lib/util.lua            Pure: error formatting, file_exists
 lib/weread.lua          WeRead protocol utilities (encoding, signing, URL helpers)
 
-Views (presentation only: given data and callbacks, no network or store I/O):
+ui/ — controllers (constructed with the plugin instance; reach siblings through
+self.plugin.<name>, KOReader's ReaderUI through self.plugin.ui):
+ui/account.lua          Login gate, account status, cookie renewal, clearing
+ui/cache_admin.lua      Download dir, cache overview/cleanup, local-cache import
+ui/chapters.lua         Catalog, chapter list, open/download entry, end-of-book
+ui/downloader.lua       Book/chapter download engine (state machine + standby guard)
+ui/host.lua             UI/network primitives every controller uses (see below)
 ui/menu.lua             The Tools > WeRead menu tree and Settings subtree
+ui/mp_articles.lua      Public-account article lists and article download
+ui/progress_sync.lua    Progress upload / reader-URL parsing (WIP)
+ui/qr_login.lua         QR login flow (protocol + its dialogs)
+ui/reader_annotations.lua  Underline visibility + tap-to-thought-popup, session guards
+ui/report_ui.lua        Reading-report menu + target picker, reading statistics
+ui/shelf.lua            Shelf listing, sort/filter, book details, store search
+
+ui/ — widgets (presentation only: given data and callbacks, no network or store
+I/O). Named by suffix so they are distinguishable from the controllers above:
 ui/download_dialog.lua  Custom download progress dialog with cancel button
 ui/end_of_book_dialog.lua  End-of-chapter navigation dialog
 ui/read_stats_view.lua  Reading-statistics page (cards, bar chart)
 ui/thought_popup.lua    Underline/thought popup widget (ScrollHtmlWidget, font preheat)
 ```
+
+`ui/report_ui.lua` keeps its suffix on purpose: `ui/reading_report.lua` would sit
+one letter away from the unrelated engine `lib/read_report.lua`.
+
+### Module naming and require paths
+
+KOReader's `PluginLoader` prepends the plugin directory to `package.path` while
+the plugin loads, then appends it afterwards (`frontend/pluginloader.lua`). All
+plugin modules are required at load time from the top of a file, so `ui.x` /
+`lib.x` resolve to our files — but a plugin file whose name matches a KOReader
+module (`frontend/ui/*.lua`: `event`, `font`, `bidi`, `time`, `size`, `trapper`,
+`uimanager`, …) would shadow it during load. Do not reuse those names.
 
 ### Controller conventions
 
@@ -72,14 +90,16 @@ ui/thought_popup.lua    Underline/thought popup widget (ScrollHtmlWidget, font p
   after construction.
 - Cross-controller calls go through `self.plugin.<name>` so construction order
   never matters (every such call happens inside a callback).
-- `lib/ui_host.lua` provides `showInfo` / `showTransientInfo` / `showBusy` /
+- `ui/host.lua` provides `showInfo` / `showTransientInfo` / `showBusy` /
   `closeBusy` / `refreshUI` / `showInputDialog` / `showList` / `safeCallback` /
   `runOnlineTask` / `runNetworkAction` / `isNetworkOnline` /
   `isNetworkConnected` / `showOffline` / `openFile` / `refreshLoginMenu`. It is
-  also what `lib/qr_login.lua` receives as its `host`.
-- Modules marked "Pure" above take no KOReader dependency (filesystem access and
-  other hosts are injected) so they can be unit-tested with a plain interpreter:
-  `lua spec/<name>_spec.lua`.
+  also what `ui/qr_login.lua` receives as its `host`.
+- Modules marked "Pure" above take no KOReader dependency at all (filesystem
+  access and other hosts are injected) so they can be unit-tested with a plain
+  interpreter: `lua spec/<name>_spec.lua`. CI runs every `spec/*_spec.lua`.
+- CI also enforces the layering rule, so a new file that requires a KOReader
+  widget must be created under `ui/`, not `lib/`.
 
 ## Key Conventions
 
@@ -104,7 +124,8 @@ self.settings:flush()                  -- must call to persist
 ### Network Pattern
 
 ```lua
-self:runNetworkAction(label, function()
+-- In a controller (self.ui_host is the injected ui/host.lua object):
+self.ui_host:runNetworkAction(label, function()
     -- runs inside NetworkMgr:runWhenOnline
     -- return string → shown as info; error → shown as error
 end)
@@ -113,7 +134,8 @@ end)
 ### Translation Pattern
 
 ```lua
--- In main.lua:
+-- At the top of any module:
+local I18n = require("lib.i18n")
 local function _(text) return I18n.tr(text) end
 _("English key")                    -- simple
 T(_("Template %1"), value)          -- with substitution (ffi/util.template)
@@ -174,7 +196,7 @@ rg -n "wrk-|wr_skey[=]|wr_rt[=]|wr_vid[=]|ptcz[=]|x-wrpa|thirdwx" -S .
 
 These are placeholder menu items shown when a WeRead book is open, currently greyed out:
 - Sync progress now — bidirectional progress sync with KOReader location mapping.
-  What exists so far lives in `lib/progress_sync.lua`: a manual upload reachable
+  What exists so far lives in `ui/progress_sync.lua`: a manual upload reachable
   only through the `weread_sync_progress` Dispatcher action, plus an unreferenced
   pull and reader-URL parser. There is no position mapping yet.
 - Book details — current-book WeRead metadata display

@@ -2,8 +2,8 @@
 -- search, and the details view for the currently open book.
 --
 -- Public-account entries are split out of the shelf here and handed to
--- lib/mp_articles.lua; chapter listing and downloading belong to
--- lib/chapters.lua. Ordering and filtering rules live in lib/shelf_sort.lua,
+-- ui/mp_articles.lua; chapter listing and downloading belong to
+-- ui/chapters.lua. Ordering and filtering rules live in lib/shelf_sort.lua,
 -- with this module owning only their translated labels.
 --
 -- The shelf list carries a cache mark per book. Rebuilding it must stay cheap,
