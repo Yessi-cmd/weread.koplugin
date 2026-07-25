@@ -285,7 +285,7 @@ function Chapters:showEndOfBookDialog(book_id)
             self.plugin.shelf:showCurrentBookDetails()
         end,
         on_read_stats = function()
-            self.plugin:showReadStats()
+            self.plugin.report_ui:showReadStats()
         end,
         on_close_book = function()
             -- Mirror KOReader's ReaderStatus:openFileBrowser(): closing the

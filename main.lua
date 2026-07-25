@@ -1,17 +1,14 @@
 local BD = require("ui/bidi")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Dispatcher = require("dispatcher")
-local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local logger = require("logger")
-local Menu = require("ui/widget/menu")
-local time = require("ui/time")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local T = require("ffi/util").template
 
 local Account = require("lib.account")
-local Annotations = require("lib.annotations")
+local AnnotationsUI = require("lib.annotations_ui")
 local BookIndex = require("lib.book_index")
 local CacheAdmin = require("lib.cache_admin")
 local Chapters = require("lib.chapters")
@@ -23,16 +20,12 @@ local MPArticles = require("lib.mp_articles")
 local ProgressSync = require("lib.progress_sync")
 local QRLogin = require("lib.qr_login")
 local ReadReport = require("lib.read_report")
-local ReadStats = require("lib.read_stats")
-local ReadStatsView = require("ui.read_stats_view")
+local ReportUI = require("lib.report_ui")
 local Settings = require("lib.settings")
 local Shelf = require("lib.shelf")
-local Thoughts = require("lib.thoughts")
 local UIHost = require("lib.ui_host")
 local Util = require("lib.util")
-local WeRead = require("lib.weread")
 local ThoughtPopup = require("ui.thought_popup")
-local ThoughtDB = require("lib.thought_db")
 
 -- `_` is the translation function; never reuse it as a loop placeholder in this file.
 local function _(text)
@@ -42,18 +35,6 @@ end
 local LOG_MODULE = "[WeRead]"
 
 local log_error = Util.log_error
-local display_error = Util.display_error
-
--- Hard ceilings for the per-session thought caches (both cleared on book close).
--- On overflow the whole map is dropped; the next tap simply re-renders / re-reads.
-local THOUGHT_HTML_CACHE_MAX = 300  -- distinct tapped underlines
-local THOUGHT_JSON_CACHE_MAX = 10   -- distinct chapters with thoughts
-
-local function thought_perf(stage, started, ...)
-    local elapsed = tonumber(time.now() - started) / 1000
-    logger.dbg(LOG_MODULE, "thought_perf", "stage=", stage,
-        "ms=", string.format("%.1f", elapsed), ...)
-end
 
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
@@ -97,10 +78,12 @@ function WeReadPlugin:init()
         end,
     }
     self.account = Account:new(self)
+    self.annotations = AnnotationsUI:new(self)
     self.cache_admin = CacheAdmin:new(self)
     self.chapters = Chapters:new(self)
     self.mp_articles = MPArticles:new(self)
     self.progress_sync = ProgressSync:new(self)
+    self.report_ui = ReportUI:new(self)
     self.shelf = Shelf:new(self)
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
@@ -112,7 +95,6 @@ function WeReadPlugin:init()
         self.read_report:maybe_start("plugin_start")
     end
     ThoughtPopup.init()
-    self._reader_session_gen = 0
     logger.info(LOG_MODULE, "initialized:", "version=", self.version)
 end
 
@@ -215,13 +197,13 @@ function WeReadPlugin:getMainMenuItems()
                 if not self.account:requireLogin(true, true) then
                     return {}
                 end
-                return self:getReadReportMenuItems()
+                return self.report_ui:getReadReportMenuItems()
             end,
         },
         {
             text = _("Reading statistics"),
             callback = self.ui_host:safeCallback(_("Reading statistics"), function()
-                self:showReadStats()
+                self.report_ui:showReadStats()
             end),
         },
         {
@@ -270,10 +252,9 @@ function WeReadPlugin:getMainMenuItems()
                 -- Keep the tap interception registered in both states; hiding is
                 -- handled by _onThoughtTap. Just close any popup already showing.
                 if not cache.show_annotations then
-                    ThoughtPopup.closeVisible()
-                    self._thought_popup_open = nil
+                    self.annotations:closePopup()
                 end
-                self:applyAnnotationVisibility()
+                self.annotations:applyVisibility()
             end),
         })
     end
@@ -459,130 +440,6 @@ function WeReadPlugin:setMPImageDownload(enabled)
     )
 end
 
-function WeReadPlugin:getReadReportMenuItems()
-    local rr = self.settings:get("read_report")
-    return {
-        {
-            text = _("Enable reading time report"),
-            checked_func = function()
-                return self.settings:get("read_report").enabled
-            end,
-            callback = self.ui_host:safeCallback(_("Enable reading time report"), function()
-                local cur = self.settings:get("read_report")
-                cur.enabled = not cur.enabled
-                self.settings:set("read_report", cur)
-                self.settings:flush()
-                if cur.enabled then
-                    if cur.mode == "auto" then
-                        self:maybeStartReadReport()
-                    elseif cur.book_id == "" then
-                        self.ui_host:showTransientInfo(_("Please select a target book"), 2)
-                        self:showReadReportBookPicker()
-                    else
-                        self:maybeStartReadReport()
-                    end
-                else
-                    self:stopReadReport()
-                end
-            end),
-        },
-        {
-            text = _("Only report when reading"),
-            checked_func = function()
-                return self.settings:get("read_report").report_on_open ~= false
-            end,
-            callback = self.ui_host:safeCallback(_("Only report when reading"), function()
-                local cur = self.settings:get("read_report")
-                cur.report_on_open = cur.report_on_open == false
-                self.settings:set("read_report", cur)
-                self.settings:flush()
-                self:stopReadReport("trigger_mode_changed")
-                if cur.enabled then
-                    self:maybeStartReadReport()
-                end
-            end),
-        },
-        {
-            text_func = function()
-                local current = self.settings:get("read_report")
-                if current.mode == "manual" and current.book_title ~= "" then
-                    return _("Select target book") .. " · " .. current.book_title
-                end
-                return _("Select target book")
-            end,
-            post_text = rr.mode == "auto" and _("Auto-associate") or nil,
-            sub_item_table_func = function()
-                return self:getReportTargetMenuItems()
-            end,
-        },
-        {
-            text = _("Report status"),
-            keep_menu_open = true,
-            callback = self.ui_host:safeCallback(_("Report status"), function()
-                local cur = self.settings:get("read_report")
-                local report_status = self.read_report:status()
-                local target
-                if cur.mode == "auto" then
-                    local auto_title = report_status.target_book_title
-                    target = auto_title and T(_("Auto: %1"), auto_title) or _("Auto-associate")
-                else
-                    target = cur.book_title ~= "" and cur.book_title or _("Not configured")
-                end
-                local status = report_status.running and _("Running") or _("Stopped")
-                local count = report_status.count
-                local last = report_status.last_time
-                    and os.date("%H:%M:%S", report_status.last_time) or "--"
-                local err = report_status.last_error or ""
-                local msg = T(_("Report book: %1\nStatus: %2"), target, status)
-                    .. "\n" .. T(_("Reported: %1 times, last: %2"), tostring(count), last)
-                if err ~= "" then
-                    msg = msg .. "\n" .. T(_("Last error: %1"), err)
-                end
-                self.ui_host:showInfo(msg)
-            end),
-        },
-    }
-end
-
-function WeReadPlugin:getReportTargetMenuItems()
-    local rr = self.settings:get("read_report")
-    return {
-        {
-            text = _("Auto-associate with WeRead book"),
-            checked_func = function()
-                return self.settings:get("read_report").mode == "auto"
-            end,
-            callback = self.ui_host:safeCallback(_("Auto-associate with WeRead book"), function()
-                local cur = self.settings:get("read_report")
-                cur.mode = "auto"
-                cur.book_id = ""
-                cur.book_title = ""
-                self.settings:set("read_report", cur)
-                self.settings:flush()
-                self:stopReadReport("target_changed")
-                if cur.enabled then
-                    self:maybeStartReadReport()
-                end
-            end),
-        },
-        {
-            text = _("Manually set report book"),
-            checked_func = function()
-                return self.settings:get("read_report").mode == "manual"
-            end,
-            post_text = rr.mode == "manual" and rr.book_title ~= "" and rr.book_title or "",
-            callback = self.ui_host:safeCallback(_("Manually set report book"), function()
-                local cur = self.settings:get("read_report")
-                cur.mode = "manual"
-                self.settings:set("read_report", cur)
-                self.settings:flush()
-                self:stopReadReport("target_changed")
-                self:showReadReportBookPicker()
-            end),
-        },
-    }
-end
-
 -- The book id of the currently open document, or nil when it is not WeRead
 -- content. The matching itself lives in lib/book_index.lua; this only supplies
 -- the plugin's settings and the book-directory resolver.
@@ -600,101 +457,6 @@ function WeReadPlugin:detectWeReadBook()
     }
 end
 
-function WeReadPlugin:showReadReportBookPicker()
-    if not self.account:requireLogin(true, true) then
-        return
-    end
-    self.ui_host:showBusy(_("Loading bookshelf..."))
-    self.ui_host:runOnlineTask(_("Bookshelf"), function()
-        local ok, result = pcall(function()
-            return self.client:gateway("/shelf/sync", {})
-        end)
-        if not ok then
-            self.ui_host:closeBusy()
-            logger.err(LOG_MODULE, "load report bookshelf failed:", log_error(result))
-            self.ui_host:showInfo(T(_("Load bookshelf failed:\n%1"), display_error(result)))
-            return
-        end
-        self.ui_host:closeBusy()
-        local all_books = result.books or {}
-        local items = {}
-        for i, book in ipairs(all_books) do
-            if not WeRead.is_mp_book(book.bookId) then
-                table.insert(items, {
-                    text = book.title or book.bookId or _("Untitled"),
-                    post_text = book.author or "",
-                    callback = self.ui_host:safeCallback(book.title or _("Select target book"), function()
-                        local rr = self.settings:get("read_report")
-                        rr.book_id = book.bookId
-                        rr.book_title = book.title or book.bookId
-                        self.settings:set("read_report", rr)
-                        self.settings:flush()
-                        self:stopReadReport("target_changed")
-                        if self._picker_menu then
-                            UIManager:close(self._picker_menu)
-                            self._picker_menu = nil
-                        end
-                        self.ui_host:showTransientInfo(T(_("Target book set: %1"), rr.book_title))
-                        self:maybeStartReadReport()
-                    end),
-                })
-            end
-        end
-        if not items or #items == 0 then
-            self.ui_host:showInfo(_("Your WeRead shelf is empty."))
-            return
-        end
-        self._picker_menu = Menu:new{
-            title = _("Select a book to report reading time"),
-            item_table = items,
-            is_borderless = true,
-            title_bar_fm_style = true,
-        }
-        UIManager:show(self._picker_menu)
-    end)
-end
-
-function WeReadPlugin:showReadStats()
-    if not self.account:requireLogin(false, true) then
-        return
-    end
-    -- Open on the monthly tab by default.
-    self:loadReadStats("monthly", nil, nil)
-end
-
--- Fetch reading statistics for a period and (re)show the visualization page.
--- old_view, when provided, is closed once the new data is ready (tab switch or
--- period navigation).
-function WeReadPlugin:loadReadStats(mode, base_time, old_view)
-    self.ui_host:showBusy(_("Loading reading statistics..."))
-    self.ui_host:runOnlineTask(_("Reading statistics"), function()
-        local ok, data = pcall(function()
-            return ReadStats.fetch(self.client, mode, base_time)
-        end)
-        self.ui_host:closeBusy()
-        if not ok then
-            logger.err(LOG_MODULE, "load reading statistics failed:", log_error(data))
-            self.ui_host:showInfo(T(_("%1 failed:\n%2"), _("Reading statistics"), display_error(data)))
-            return
-        end
-        if old_view then
-            UIManager:close(old_view)
-        end
-        local view
-        view = ReadStatsView.show(data, {
-            on_prev = function()
-                self:loadReadStats(mode, data.prev_base_time, view)
-            end,
-            on_next = function()
-                self:loadReadStats(mode, data.next_base_time, view)
-            end,
-            on_switch = function(new_mode)
-                self:loadReadStats(new_mode, nil, view)
-            end,
-        })
-    end)
-end
-
 function WeReadPlugin:onShowWeRead()
     self.account:showAccountStatus()
 end
@@ -703,529 +465,16 @@ function WeReadPlugin:onWeReadSyncProgress()
     self.progress_sync:uploadCurrentProgress()
 end
 
--- Runtime CSS that hides underlines and thought stars baked into cached EPUBs.
--- Applied as an appended stylesheet (not persisted to the book sidecar) so it
--- acts as a global display preference without mutating downloaded files.
--- NOTE: only tweak visual/metric properties (border, padding, font-size). Never
--- use display/white-space here — changing those marks the built DOM stale and
--- makes ReaderRolling repeatedly prompt for a full document reload.
-local ANNOTATION_HIDE_CSS =
-    ".wr-underline{border-bottom:0 !important;padding-bottom:0 !important;} .wr-star{font-size:0 !important;} "
-    .. ".wr-thought-link{pointer-events:none !important;text-decoration:none !important;color:inherit !important;}"
-
--- Apply the initial hidden state before KOReader renders the document. Doing
--- this from onReaderReady starts partial rerendering; its seamless reload then
--- creates a new plugin instance and repeats the same rerender forever.
+-- Fires before KOReader renders the document, which is the only safe moment to
+-- apply the "annotations hidden" stylesheet (see lib/annotations_ui.lua).
 function WeReadPlugin:onReadSettings()
-    if not self.ui or not self.ui.document or not self:detectWeReadBook() then
-        return
-    end
-    if self.settings:get("cache").show_annotations ~= false then
-        return
-    end
-    local typeset = self.ui.typeset
-    if not typeset or not typeset.css then
-        logger.warn(LOG_MODULE, "onReadSettings: typeset stylesheet unavailable")
-        return
-    end
-    local tweaks = ""
-    local styletweak = self.ui.styletweak
-    if styletweak and type(styletweak.getCssText) == "function" then
-        tweaks = styletweak:getCssText() or ""
-    end
-    local ok, err = pcall(function()
-        self.ui.document:setStyleSheet(typeset.css, tweaks .. "\n" .. ANNOTATION_HIDE_CSS)
-    end)
-    if not ok then
-        logger.warn(LOG_MODULE, "initial annotation visibility failed:", err)
-    end
-end
-
--- Reapply the current annotation visibility preference to the open WeRead book.
--- Show=true reapplies the base stylesheet + user tweaks (revealing baked-in
--- underlines); show=false appends ANNOTATION_HIDE_CSS on top. Triggers a reflow.
-function WeReadPlugin:applyAnnotationVisibility()
-    if not self.ui or not self.ui.document then
-        return
-    end
-    if not self:detectWeReadBook() then
-        return
-    end
-    local typeset = self.ui.typeset
-    if not typeset or not typeset.css then
-        logger.warn(LOG_MODULE, "applyAnnotationVisibility: typeset stylesheet unavailable")
-        return
-    end
-    local show = self.settings:get("cache").show_annotations ~= false
-    local tweaks = ""
-    local styletweak = self.ui.styletweak
-    if styletweak and type(styletweak.getCssText) == "function" then
-        tweaks = styletweak:getCssText() or ""
-    end
-    if not show then
-        tweaks = tweaks .. "\n" .. ANNOTATION_HIDE_CSS
-    end
-    local ok, err = pcall(function()
-        self.ui.document:setStyleSheet(typeset.css, tweaks)
-        self.ui:handleEvent(Event:new("UpdatePos"))
-    end)
-    if not ok then
-        logger.warn(LOG_MODULE, "applyAnnotationVisibility failed:", err)
-    end
-end
-
--- Hide our thought anchors from KOReader's link hit-testing while annotations
--- are hidden. crengine ignores CSS pointer-events for link detection, so without
--- this a tap on a hidden underline is swallowed by ReaderLink (it follows the
--- #wrthought anchor, a same-page jump) instead of turning the page. Returning nil
--- makes ReaderLink's tap_link handler find no link and decline, so the tap falls
--- through to KOReader's native page-turn (honoring the user's tap zones / RTL).
--- Only our own anchors are hidden, and only while annotations are off.
-function WeReadPlugin:_installLinkFilter()
-    if not self.ui or not self.ui.link or self._orig_getLinkFromGes then
-        return
-    end
-    self._orig_getLinkFromGes = self.ui.link.getLinkFromGes
-    local plugin = self
-    self.ui.link.getLinkFromGes = function(link_self, ges)
-        local link = plugin._orig_getLinkFromGes(link_self, ges)
-        if link and plugin.settings:get("cache").show_annotations == false then
-            local href = plugin:_linkHref(link)
-            if type(href) == "string" and href:find("wrthought%-") then
-                return nil
-            end
-        end
-        return link
-    end
-end
-
-function WeReadPlugin:_removeLinkFilter()
-    if self._orig_getLinkFromGes and self.ui and self.ui.link then
-        self.ui.link.getLinkFromGes = self._orig_getLinkFromGes
-    end
-    self._orig_getLinkFromGes = nil
-end
-
-function WeReadPlugin:_teardownThoughtInterception()
-    if self._thought_interception_setup and self.ui then
-        self.ui:unRegisterTouchZones({
-            { id = "weread_thought_tap", overrides = { "tap_link" } },
-        })
-        self._thought_interception_setup = nil
-    end
-    self:_removeLinkFilter()
-    ThoughtPopup.closeVisible()
-    ThoughtPopup.cancelPrewarm()
-    self._thought_popup_open = nil
-    self._current_thought_popup = nil
-    self._thought_html_cache = nil
-    self._thought_html_cache_n = nil
-    self._thought_json_cache = nil
-    self._thought_json_cache_n = nil
-    self._thought_highlight_active = nil
-    self._current_weread_book_id = nil
-end
-
-function WeReadPlugin:_setupThoughtInterception()
-    local Device = require("device")
-    if not Device:isTouchDevice() then
-        return
-    end
-    if not self.ui or self._thought_interception_setup then
-        return
-    end
-
-    self.ui:registerTouchZones({
-        {
-            id = "weread_thought_tap",
-            ges = "tap",
-            screen_zone = { ratio_x = 0, ratio_y = 0, ratio_w = 1, ratio_h = 1 },
-            overrides = { "tap_link" },
-            handler = function(ges)
-                return self:_onThoughtTap(ges)
-            end,
-        },
-    })
-    self:_installLinkFilter()
-    self._thought_interception_setup = true
-end
-
-function WeReadPlugin:_clearThoughtHighlight(document)
-    if not self._thought_highlight_active then
-        return
-    end
-    pcall(function()
-        document:highlightXPointer()
-    end)
-    self._thought_highlight_active = nil
-    UIManager:setDirty(self.dialog, "ui")
-end
-
-function WeReadPlugin:_getThoughtPopupLayoutParams()
-    if not self.ui or not self.ui.document then
-        return nil
-    end
-
-    local Screen = require("device").screen
-    local document = self.ui.document
-
-    local font_face = self.ui.font and self.ui.font.font_face
-    if not font_face then
-        font_face = G_reader_settings:readSetting("cre_font")
-    end
-
-    local font_size = G_reader_settings:readSetting("footnote_popup_absolute_font_size")
-    local font_size_scaled
-    if font_size then
-        font_size_scaled = Screen:scaleBySize(font_size)
-    else
-        local relative = G_reader_settings:readSetting("footnote_popup_relative_font_size") or -2
-        local doc_font_size = (document.configurable and document.configurable.font_size) or 18
-        font_size_scaled = Screen:scaleBySize(doc_font_size) + relative
-    end
-
-    return {
-        doc_font_name = font_face,
-        doc_font_size = font_size_scaled,
-        doc_margins = document:getPageMargins(),
-        height_ratio = 0.35,
-    }
-end
-
-function WeReadPlugin:_showThoughtPopup(html, link, session_gen, tap_started)
-    local show_started = time.now()
-    if session_gen and session_gen ~= self._reader_session_gen then
-        self._thought_popup_open = nil
-        return
-    end
-    if type(html) ~= "string" or html == "" then
-        self._thought_popup_open = nil
-        return
-    end
-
-    local Screen = require("device").screen
-    local document = self.ui.document
-    if link.from_xpointer then
-        local highlight_started = time.now()
-        local ok = pcall(function()
-            document:highlightXPointer()
-            document:highlightXPointer(link.from_xpointer)
-        end)
-        thought_perf("highlight", highlight_started, "ok=", tostring(ok))
-        if ok then
-            self._thought_highlight_active = true
-            UIManager:setDirty(self.dialog, "partial")
-        end
-    end
-
-    local params_started = time.now()
-    local params = self:_getThoughtPopupLayoutParams()
-    thought_perf("layout_params", params_started)
-    if not params then
-        self._thought_popup_open = nil
-        return
-    end
-
-    local fonts_started = time.now()
-    ThoughtPopup.preloadFonts(params.doc_font_name)
-    thought_perf("preload_fonts", fonts_started)
-
-    local popup_started = time.now()
-    local ok, popup = pcall(function()
-        return ThoughtPopup.show({
-            html = html,
-            doc_font_name = params.doc_font_name,
-            doc_font_size = params.doc_font_size,
-            doc_margins = params.doc_margins,
-            height_ratio = params.height_ratio,
-            dialog = self.dialog,
-            close_callback = function(footnote_height)
-                self._thought_popup_open = nil
-                self._current_thought_popup = nil
-                if self._thought_highlight_active then
-                    local highlight_page = document:getCurrentPage()
-                    local clear_gen = self._reader_session_gen or 0
-                    local clear_highlight = function()
-                        if clear_gen ~= self._reader_session_gen then
-                            return
-                        end
-                        document:highlightXPointer()
-                        if document:getCurrentPage() == highlight_page then
-                            UIManager:setDirty(self.dialog, "ui")
-                        end
-                    end
-                    self._thought_highlight_active = nil
-                    local footnote_top_y = Screen:getHeight() - footnote_height
-                    if link.link_y and link.link_y > footnote_top_y then
-                        UIManager:scheduleIn(0.5, clear_highlight)
-                    else
-                        clear_highlight()
-                    end
-                end
-            end,
-        })
-    end)
-    thought_perf("popup_show", popup_started, "ok=", tostring(ok),
-        "html_bytes=", tostring(#html))
-
-    if not ok then
-        logger.warn(LOG_MODULE, "thought popup failed:", popup)
-        self._thought_popup_open = nil
-        self:_clearThoughtHighlight(document)
-        return
-    end
-
-    self._current_thought_popup = popup
-    thought_perf("show_pipeline", show_started, "html_bytes=", tostring(#html))
-    if tap_started then
-        thought_perf("tap_to_popup_return", tap_started, "html_bytes=", tostring(#html))
-    end
-end
-
--- Recursively pull a thought anchor href out of a KOReader link object.
--- The link's shape differs between engines and even between tap locations inside
--- the same anchor (tapping the star vs the underlined text can expose the href
--- under a different field), so scan common fields first, then a shallow crawl.
-function WeReadPlugin:_linkHref(link)
-    local seen = {}
-    local function extract(value, depth)
-        if depth > 4 or value == nil then
-            return nil
-        end
-        if type(value) == "string" then
-            return value:match("(#wrthought%-[%w%._%-]+)")
-                or value:match("(wrthought%-[%w%._%-]+)")
-        end
-        if type(value) ~= "table" or seen[value] then
-            return nil
-        end
-        seen[value] = true
-        for _, key in ipairs({ "href", "url", "target", "link", "uri", "dest", "destination", "src" }) do
-            local found = extract(value[key], depth + 1)
-            if found then
-                return found
-            end
-        end
-        for _, child in pairs(value) do
-            local found = extract(child, depth + 1)
-            if found then
-                return found
-            end
-        end
-        return nil
-    end
-    return extract(link, 0)
-end
-
--- Parse "#wrthought-<book>-<chapter>-<start>-<end>" into its parts. The last two
--- segments are numeric (range start/end); book/chapter must not contain dashes
--- (true for WeRead IDs in practice).
-function WeReadPlugin:_parseThoughtHref(href)
-    if type(href) ~= "string" then
-        return nil
-    end
-    local anchor = href:match("#?(wrthought%-[%w%._%-]+)")
-    if not anchor then
-        return nil
-    end
-    local book_id, chapter_uid, start_pos, end_pos =
-        anchor:match("^wrthought%-([^%-]+)%-([^%-]+)%-(%d+)%-(%d+)$")
-    if not (book_id and chapter_uid and start_pos and end_pos) then
-        logger.warn(LOG_MODULE, "unparseable thought anchor:", anchor)
-        return nil
-    end
-    return {
-        book_id = book_id,
-        chapter_uid = chapter_uid,
-        range = start_pos .. "-" .. end_pos,
-    }
-end
-
--- Load a chapter's cached thoughts, memoized per (book, chapter) so tapping
--- different underlines in the same chapter reads/decodes the JSON only once.
--- Returns the decoded reviews array, or false if the chapter has no cache.
-function WeReadPlugin:_loadThoughtReviews(book_id, chapter_uid)
-    self._thought_json_cache = self._thought_json_cache or {}
-    local key = tostring(book_id) .. ":" .. tostring(chapter_uid)
-    local cached = self._thought_json_cache[key]
-    if cached ~= nil then
-        return cached
-    end
-    local reviews = Thoughts.load_cache(self.settings, book_id, chapter_uid)
-    if type(reviews) ~= "table" then
-        reviews = false
-    end
-    self._thought_json_cache_n = (self._thought_json_cache_n or 0) + 1
-    if self._thought_json_cache_n > THOUGHT_JSON_CACHE_MAX then
-        self._thought_json_cache = {}
-        self._thought_json_cache_n = 1
-    end
-    self._thought_json_cache[key] = reviews
-    return reviews
-end
-
--- Load the chapter's cached thoughts, match the tapped range, render popup HTML.
-function WeReadPlugin:_buildThoughtHtmlFromHref(href)
-    local info = self:_parseThoughtHref(href)
-    if not info then
-        return nil
-    end
-
-    -- 1. Try SQLite indexed lookup
-    local books = self.settings:get("books", {})
-    local book = books[info.book_id]
-    if book then
-        local book_dir = Content.book_resolved_dir(self.settings, info.book_id, book)
-        local db = ThoughtDB.open(book_dir)
-        if db then
-            local sql_html = ThoughtDB.getReviewHTML(db, info.chapter_uid, info.range)
-            ThoughtDB.close(db)
-            if sql_html then
-                return sql_html
-            end
-        end
-    end
-
-    -- 2. JSON fallback for legacy caches
-    local reviews = self:_loadThoughtReviews(info.book_id, info.chapter_uid)
-    if type(reviews) ~= "table" then
-        self.ui_host:showInfo(_("Thought cache error. Please re-download this book with underlines and thoughts."))
-        return nil
-    end
-    for _i, rv in ipairs(reviews) do
-        if tostring(rv.range or "") == info.range then
-            local html = Annotations.buildThoughtPopupHtml(rv)
-            if type(html) == "string" and html ~= "" then
-                return html
-            end
-            break
-        end
-    end
-    self.ui_host:showInfo(_("No matching thought found for this underline."))
-    return nil
-end
-
-function WeReadPlugin:_onThoughtTap(ges)
-    local tap_started = time.now()
-    if not self.ui or not self.ui.document or not self.ui.link then
-        return false
-    end
-    -- The tap zone is only registered for WeRead books, so a cached flag is
-    -- enough here; avoid re-scanning the book table on every tap.
-    if not self._current_weread_book_id then
-        return false
-    end
-
-    local link_started = time.now()
-    local ok, link = pcall(function()
-        return self.ui.link:getLinkFromGes(ges)
-    end)
-    thought_perf("link_lookup", link_started, "found=", tostring(ok and link ~= nil))
-    -- No followable link here (e.g. hidden underline whose link is disabled via
-    -- pointer-events:none) → return false so the tap falls through to KOReader's
-    -- default page-turn, honoring the user's tap-zone / RTL settings.
-    if not ok or not link then
-        return false
-    end
-
-    local href = self:_linkHref(link)
-    if type(href) ~= "string" or not href:find("wrthought%-") then
-        -- Some other EPUB link (footnote, TOC, external) → let KOReader handle it.
-        return false
-    end
-
-    -- Annotations hidden: _installLinkFilter already made getLinkFromGes return nil
-    -- for our anchors, so we normally return above before reaching here. Kept as a
-    -- defensive fall-through in case the filter is not active.
-    if self.settings:get("cache").show_annotations == false then
-        return false
-    end
-
-    -- Cache the rendered HTML by href (stable, page-independent).
-    self._thought_html_cache = self._thought_html_cache or {}
-    local html = self._thought_html_cache[href]
-    if html == nil then
-        -- SQLite lookup is sub-millisecond; JSON fallback is a single file read.
-        -- No loading message needed.
-        html = self:_buildThoughtHtmlFromHref(href) or false
-        self._thought_html_cache_n = (self._thought_html_cache_n or 0) + 1
-        if self._thought_html_cache_n > THOUGHT_HTML_CACHE_MAX then
-            self._thought_html_cache = {}
-            self._thought_html_cache_n = 1
-        end
-        self._thought_html_cache[href] = html
-    end
-    thought_perf("tap_resolve", tap_started, "cached=", tostring(html ~= nil),
-        "html_bytes=", tostring(type(html) == "string" and #html or 0))
-    if html == false or type(html) ~= "string" then
-        -- Recognized our underline but have no content (already told the user why,
-        -- e.g. deleted cache). Consume the tap so tap_link does not follow the
-        -- now-pointless #wrthought anchor.
-        return true
-    end
-
-    -- Guard against a stale flag: if we believe a popup is open but it is not
-    -- actually on screen (e.g. it was closed through a path that skipped the
-    -- close callback), reset instead of silently swallowing every tap forever.
-    if self._thought_popup_open then
-        if ThoughtPopup.isShowing() then
-            return true
-        end
-        self._thought_popup_open = nil
-    end
-    self._thought_popup_open = true
-    local session_gen = self._reader_session_gen or 0
-    local scheduled_at = time.now()
-    UIManager:nextTick(function()
-        thought_perf("next_tick_delay", scheduled_at)
-        if session_gen ~= self._reader_session_gen then
-            self._thought_popup_open = nil
-            return
-        end
-        if not self.ui or not self.ui.document then
-            self._thought_popup_open = nil
-            return
-        end
-        self:_showThoughtPopup(html, link, session_gen, tap_started)
-    end)
-    return true
+    self.annotations:applyInitialVisibility()
 end
 
 function WeReadPlugin:onReaderReady()
-    self._reader_session_gen = (self._reader_session_gen or 0) + 1
-    self:_teardownThoughtInterception()
-
     local weread_book_id = self:detectWeReadBook()
-    -- Cache it so the per-tap handler (_onThoughtTap) does not have to re-scan
-    -- the whole book table on every screen tap.
-    self._current_weread_book_id = weread_book_id
+    self.annotations:onReaderReady(weread_book_id)
     if weread_book_id then
-        -- Always register the tap interception: even when annotations are hidden
-        -- we must intercept taps on thought links to suppress the native footnote
-        -- popup. Visibility is decided inside _onThoughtTap / applyAnnotationVisibility.
-        self:_setupThoughtInterception()
-        local show_annotations = self.settings:get("cache").show_annotations ~= false
-        UIManager:nextTick(function()
-            if not self.ui or not self.ui.document then
-                return
-            end
-            if not show_annotations then
-                return
-            end
-            local params = self:_getThoughtPopupLayoutParams()
-            if not params then
-                return
-            end
-            ThoughtPopup.preloadFonts(params.doc_font_name)
-            ThoughtPopup.prewarm({
-                doc_font_name = params.doc_font_name,
-                doc_font_size = params.doc_font_size,
-                doc_margins = params.doc_margins,
-                height_ratio = params.height_ratio,
-                dialog = self.dialog,
-            })
-        end)
-
         self.chapters:installEndOfBookHook()
     else
         self.chapters:removeEndOfBookHook()
@@ -1239,18 +488,9 @@ function WeReadPlugin:onReaderReady()
 end
 
 function WeReadPlugin:onCloseDocument()
-    self._reader_session_gen = (self._reader_session_gen or 0) + 1
-    self:_teardownThoughtInterception()
+    self.annotations:onCloseDocument()
     self.chapters:removeEndOfBookHook()
     self.read_report:on_close_document()
-end
-
-function WeReadPlugin:maybeStartReadReport()
-    return self.read_report:maybe_start("menu")
-end
-
-function WeReadPlugin:stopReadReport(reason)
-    self.read_report:stop(reason or "explicit_stop")
 end
 
 function WeReadPlugin:onSuspend()
