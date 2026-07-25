@@ -60,13 +60,13 @@
 
 ## 阶段三：阅读时展示（Display）
 
-### 打开书 `onReaderReady`（`main.lua`）
+### 打开书 `onReaderReady`（`main.lua` → `lib/annotations_ui.lua`）
 
 - 检测是 WeRead 书 → `_setupThoughtInterception`：注册一个**覆盖全屏的 tap 手势区**，`overrides = {"tap_link"}` —— **抢在 KOReader 内建的脚注弹窗（tap_link）之前**接管点击。
-- `applyAnnotationVisibility`：按 `show_annotations` 开关，决定是否往排版样式表追加隐藏注释的 CSS —— 这就是「显示 / 隐藏划线」开关的实现。
+- `applyVisibility`：按 `show_annotations` 开关，决定是否往排版样式表追加隐藏注释的 CSS —— 这就是「显示 / 隐藏划线」开关的实现。
 - **预热** `ThoughtPopup.prewarm`（`ui/thought_popup.lua`）：用占位 HTML 提前创建一次渲染 widget，把 MuPDF 引擎 / 字体 / CSS 缓存热起来，让首次点击不卡。
 
-### 点击划线 `_onThoughtTap`（`main.lua`）
+### 点击划线 `_onThoughtTap`（`lib/annotations_ui.lua`）
 
 1. `self.ui.link:getLinkFromGes(ges)` 拿到点击处链接 —— 因为划线被 `<a href="#thought_...">` 包裹，KOReader 把它当作 link，返回 `link.xpointer`（指向目标 aside 节点）。
 2. `getHTMLFromXPointer(link.xpointer, 0x1001, false)` 提取**那一个 aside 节点**的 HTML。第三参数 `false` 很关键：不扩展到父节点，否则会把整个 footnotes section（上百条脚注）全拉出来，MuPDF 会卡死。结果按 `xpointer` 缓存。
@@ -95,4 +95,4 @@
 | `lib/thoughts.lua` | 下载编排、想法 JSON 缓存、CSS 合并 |
 | `lib/annotations.lua` | 核心：把划线/想法注入 HTML（下划线 span + noteref 链接 + footnote aside） |
 | `ui/thought_popup.lua` | 展示：ScrollHtmlWidget 底部浮层、字体预热、单例复用 |
-| `main.lua` | tap 拦截、xpointer 提取、显隐开关、会话防错 |
+| `lib/annotations_ui.lua` | tap 拦截、xpointer 提取、显隐开关、会话防错 |
