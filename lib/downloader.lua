@@ -23,6 +23,7 @@ local Content = require("lib.content")
 local DownloadDialog = require("ui.download_dialog")
 local I18n = require("lib.i18n")
 local Thoughts = require("lib.thoughts")
+local Util = require("lib.util")
 local WeRead = require("lib.weread")
 
 local LOG_MODULE = "[WeRead]"
@@ -31,22 +32,8 @@ local function _(text)
     return I18n.tr(text)
 end
 
-local function log_error(err)
-    local text = tostring(err):gsub("[%c]+", " ")
-    if #text > 500 then
-        return text:sub(1, 500) .. "..."
-    end
-    return text
-end
-
-local function display_error(err)
-    local text = tostring(err)
-    text = text:match("^[^\r\n]+") or text
-    if #text > 300 then
-        return text:sub(1, 300) .. "..."
-    end
-    return text
-end
+local log_error = Util.log_error
+local display_error = Util.display_error
 
 -- Block OS-level standby (Kindle powerd, Kobo lid/menu-suspend, etc.)
 local function preventOsStandby()
