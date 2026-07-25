@@ -1,0 +1,500 @@
+-- Cache administration: where downloaded books live and how they are removed.
+--
+-- Covers three related jobs behind the Settings > Cache management menu:
+--   * the download directory (validate, pick, and migrate existing books to it),
+--   * the cache overview (per-book sizes, single-book and bulk cleanup),
+--   * importing content that is already on disk (lib/scan.lua).
+--
+-- Two safety rules are load-bearing here and must survive any change:
+--   * Only entries tracked in the books table are ever listed or deleted. The
+--     download directory can be a user-selected library folder, so scanning the
+--     filesystem and rm -rf'ing what it finds could destroy unrelated data.
+--   * A move never overwrites an existing target directory, for the same reason.
+
+local ConfirmBox = require("ui/widget/confirmbox")
+local PathChooser = require("ui/widget/pathchooser")
+local UIManager = require("ui/uimanager")
+local logger = require("logger")
+local T = require("ffi/util").template
+
+local Content = require("lib.content")
+local I18n = require("lib.i18n")
+local Scan = require("lib.scan")
+local Util = require("lib.util")
+local WeRead = require("lib.weread")
+
+local function _(text)
+    return I18n.tr(text)
+end
+
+local LOG_MODULE = "[WeRead]"
+
+local log_error = Util.log_error
+local display_error = Util.display_error
+
+local CacheAdmin = {}
+CacheAdmin.__index = CacheAdmin
+
+function CacheAdmin:new(plugin)
+    return setmetatable({
+        plugin = plugin,
+        settings = plugin.settings,
+        client = plugin.client,
+        ui_host = plugin.ui_host,
+    }, self)
+end
+
+-- Returns true if the directory is usable (creatable and writable), else false + message.
+function CacheAdmin:validateDownloadDir(path)
+    local lfs = require("libs/libkoreader-lfs")
+    if type(path) ~= "string" or path == "" then
+        return false, _("Invalid path.")
+    end
+    if not lfs.attributes(path, "mode") then
+        os.execute("mkdir -p " .. string.format("%q", path))
+        if not lfs.attributes(path, "mode") then
+            return false, _("Directory does not exist and could not be created.")
+        end
+    end
+    local test_file = path .. "/.weread_write_test"
+    local f = io.open(test_file, "w")
+    if not f then
+        return false, _("Directory is not writable.")
+    end
+    f:close()
+    os.remove(test_file)
+    return true
+end
+
+function CacheAdmin:showDownloadDirPicker(touchmenu_instance)
+    local current = self.settings:get_download_dir()
+    local path_chooser = PathChooser:new{
+        select_directory = true,
+        select_file = false,
+        path = current,
+        onConfirm = function(path)
+            local ok, err = self:validateDownloadDir(path)
+            if not ok then
+                self.ui_host:showInfo(T(_("Cannot use this directory: %1"), err))
+                return
+            end
+            local old_dir = self.settings:get_download_dir()
+            self.settings:set_download_dir(path)
+            logger.info(LOG_MODULE, "download directory changed:", path)
+            if touchmenu_instance then
+                touchmenu_instance:updateItems()
+            end
+            self:offerMoveBooksToNewDir(old_dir, path)
+        end,
+    }
+    UIManager:show(path_chooser)
+end
+
+-- After the download directory changes, offer to move already-cached books from
+-- their old locations into the new directory. Without this, old files stay behind
+-- as orphans (still reachable via the stored paths, but not under the new root).
+function CacheAdmin:offerMoveBooksToNewDir(old_dir, new_dir)
+    if old_dir == new_dir then
+        self:offerScanNewDir(new_dir, T(_("Download directory set to:\n%1"), new_dir))
+        return
+    end
+    local lfs = require("libs/libkoreader-lfs")
+    local books = self.settings:get("books", {})
+    local movable = {}
+    for book_id, book in pairs(books) do
+        local src = Content.book_resolved_dir(self.settings, book_id, book)
+        local dst = Content.book_cache_dir(self.settings, book_id)
+        if src ~= dst then
+            local attr = lfs.attributes(src)
+            if attr and attr.mode == "directory" then
+                table.insert(movable, { book_id = book_id, src = src, dst = dst })
+            end
+        end
+    end
+    if #movable == 0 then
+        self:offerScanNewDir(new_dir, T(_("Download directory set to:\n%1"), new_dir))
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Download directory changed. Move %1 cached book(s) to the new location?"), tostring(#movable)),
+        ok_text = _("Move"),
+        ok_callback = function()
+            self:moveBooksToNewDir(movable, new_dir)
+        end,
+        cancel_text = _("Keep"),
+        cancel_callback = function()
+            self:offerScanNewDir(new_dir, T(_("Download directory set to:\n%1\nExisting downloads stay in the old location."), new_dir))
+        end,
+    })
+end
+
+function CacheAdmin:moveBooksToNewDir(movable, new_dir)
+    self.ui_host:showBusy(_("Moving cached books..."))
+    UIManager:scheduleIn(0.1, function()
+        local books = self.settings:get("books", {})
+        local moved, skipped, failed = 0, 0, 0
+        for _i, m in ipairs(movable) do
+            local ok, reason = self:moveBookDir(m.src, m.dst)
+            if ok then
+                local book = books[m.book_id]
+                if book then
+                    book.cache_dir = m.dst
+                    book.cached_file = self:remapCachedPath(book.cached_file, m.dst)
+                    if type(book.cached_chapters) == "table" then
+                        for uid, path in pairs(book.cached_chapters) do
+                            book.cached_chapters[uid] = self:remapCachedPath(path, m.dst)
+                        end
+                    end
+                end
+                moved = moved + 1
+            elseif reason == "target_exists" then
+                skipped = skipped + 1
+                logger.warn(LOG_MODULE, "skip move, target exists:", m.dst)
+            else
+                failed = failed + 1
+                logger.err(LOG_MODULE, "move book cache failed:", m.src, "->", m.dst)
+            end
+        end
+        self.settings:set("books", books)
+        self.settings:flush()
+        self.ui_host:closeBusy()
+        local message
+        if skipped == 0 and failed == 0 then
+            message = T(_("Moved %1 book(s) to:\n%2"), tostring(moved), new_dir)
+        else
+            message = T(_("Moved %1 book(s). %2 skipped (target already exists), %3 failed. These stay in the old location."), tostring(moved), tostring(skipped), tostring(failed))
+        end
+        self:offerScanNewDir(new_dir, message)
+    end)
+end
+
+-- Move one book directory to dst. Uses `mv`, which (unlike os.rename) handles
+-- moves across filesystems, e.g. internal storage to an SD card. Returns
+-- true on success, or false plus a reason ("target_exists" / "move_failed").
+function CacheAdmin:moveBookDir(src, dst)
+    if src == dst then
+        return true
+    end
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(dst) then
+        -- The target already exists. Since the new directory is user-selected, it
+        -- may be unrelated user data that only happens to share the sanitized name.
+        -- Never delete it; leave the book in its old location instead.
+        return false, "target_exists"
+    end
+    local parent = dst:match("^(.*)/[^/]+$")
+    if parent then
+        os.execute("mkdir -p " .. string.format("%q", parent))
+    end
+    local status = os.execute("mv -f " .. string.format("%q", src) .. " " .. string.format("%q", dst))
+    if status == true or status == 0 then
+        return true
+    end
+    return false, "move_failed"
+end
+
+-- Rewrite a stored absolute file path to sit under the new book directory,
+-- keeping the original filename.
+function CacheAdmin:remapCachedPath(path, dst)
+    if type(path) ~= "string" then
+        return path
+    end
+    local name = path:match("[^/]+$")
+    if not name then
+        return path
+    end
+    return dst .. "/" .. name
+end
+
+function CacheAdmin:showCacheManagement()
+    local lfs = require("libs/libkoreader-lfs")
+    local books = self.settings:get("books", {})
+    local items = {}
+    local entries = {}
+    local seen_dirs = {}
+    local total_size = 0
+    local mp_total_size = 0
+
+    local function directory_stats(path)
+        local size = 0
+        local file_count = 0
+        local ok, iter, dir_obj = pcall(lfs.dir, path)
+        if not ok then
+            return size, file_count
+        end
+        for entry in iter, dir_obj do
+            if entry ~= "." and entry ~= ".." then
+                local child = path .. "/" .. entry
+                local attr = lfs.attributes(child)
+                if attr and attr.mode == "file" then
+                    size = size + (attr.size or 0)
+                    file_count = file_count + 1
+                elseif attr and attr.mode == "directory" then
+                    local child_size, child_count = directory_stats(child)
+                    size = size + child_size
+                    file_count = file_count + child_count
+                end
+            end
+        end
+        return size, file_count
+    end
+
+    local function add_cache_entry(book_id, title, book_dir)
+        if seen_dirs[book_dir] then
+            return
+        end
+        seen_dirs[book_dir] = true
+        local size, file_count = directory_stats(book_dir)
+        if file_count == 0 then
+            return
+        end
+        local is_mp = WeRead.is_mp_book(book_id)
+        total_size = total_size + size
+        if is_mp then
+            mp_total_size = mp_total_size + size
+        end
+        table.insert(entries, {
+            book_id = book_id,
+            title = title or book_id,
+            size = size,
+            file_count = file_count,
+            is_mp = is_mp,
+        })
+    end
+
+    -- Only list plugin-owned entries tracked in the books table. Scanning the
+    -- filesystem would list unrelated subfolders when cache_dir is a user-selected
+    -- library directory, and deleting one would rm -rf a non-WeRead folder.
+    for book_id, book in pairs(books) do
+        add_cache_entry(book_id, book.title, Content.book_resolved_dir(self.settings, book_id, book))
+    end
+
+    table.sort(entries, function(a, b)
+        if a.is_mp ~= b.is_mp then
+            return a.is_mp
+        end
+        return tostring(a.title):lower() < tostring(b.title):lower()
+    end)
+
+    local total_str = total_size < 1024 * 1024
+        and string.format("%.0f KB", total_size / 1024)
+        or string.format("%.1f MB", total_size / 1024 / 1024)
+    local mp_total_str = mp_total_size < 1024 * 1024
+        and string.format("%.0f KB", mp_total_size / 1024)
+        or string.format("%.1f MB", mp_total_size / 1024 / 1024)
+    table.insert(items, {
+        text = T(_("[Cleanup] Clear all public account cache (%1)"), mp_total_str),
+        callback = self.ui_host:safeCallback(_("Clear all public account cache"), function()
+            UIManager:show(ConfirmBox:new{
+                text = _("Clear all public account cache? Downloaded articles and cached article lists will be deleted."),
+                ok_text = _("Clear"),
+                ok_callback = function()
+                    self:clearAllMPCache()
+                    self:refreshCacheManagement(_("Public account cache cleared"))
+                end,
+            })
+        end),
+    })
+    table.insert(items, {
+        text = T(_("[Cleanup] Clear all cache (%1)"), total_str),
+        separator = true,
+        callback = self.ui_host:safeCallback(_("Clear all cache"), function()
+            UIManager:show(ConfirmBox:new{
+                text = _("Clear all cache? Downloaded books and articles will be deleted."),
+                ok_text = _("Clear"),
+                ok_callback = function()
+                    self:clearAllCache()
+                    self:refreshCacheManagement(_("Cache cleared"))
+                end,
+            })
+        end),
+    })
+
+    for entry_index, entry in ipairs(entries) do
+        local size_str = entry.size < 1024 * 1024
+            and string.format("%.0f KB", entry.size / 1024)
+            or string.format("%.1f MB", entry.size / 1024 / 1024)
+        table.insert(items, {
+            text = entry.title,
+            post_text = T(_("%1 files, %2"), tostring(entry.file_count), size_str),
+            mandatory = entry.is_mp and _("Public Account") or "",
+            callback = self.ui_host:safeCallback(entry.title, function()
+                self:confirmClearBookCache(entry.book_id, entry.title)
+            end),
+        })
+    end
+
+    self.cache_menu = self.ui_host:showList(_("Cache management"), items, _("No cached items"))
+end
+
+function CacheAdmin:refreshCacheManagement(message)
+    if self.cache_menu then
+        UIManager:close(self.cache_menu)
+        self.cache_menu = nil
+    end
+    self:showCacheManagement()
+    if message then
+        self.ui_host:showTransientInfo(message)
+    end
+end
+
+-- Register manually copied content under a download root into the books table.
+-- Only directories whose name matches a shelf book id in `allowed` are imported
+-- (see lib/scan.lua), so unrelated folders in a user-selected download dir can
+-- never be registered and later removed by cache cleanup.
+function CacheAdmin:scanLocalCache(root, allowed, dry_run)
+    local lfs = require("libs/libkoreader-lfs")
+    local books = self.settings:get("books", {})
+    local added, updated = Scan.scan_root({
+        root = root,
+        fs = lfs,
+        books = books,
+        allowed = allowed,
+        is_mp = WeRead.is_mp_book,
+        dry_run = dry_run,
+        now = os.time(),
+    })
+    if not dry_run then
+        self.settings:set("books", books)
+        self.settings:flush()
+    end
+    return added, updated
+end
+
+-- Build the set of importable directory names from the user's WeRead shelf.
+-- Must be called from an online context; raises on API failure.
+function CacheAdmin:fetchShelfAllowedMap()
+    local result = self.client:gateway("/shelf/sync", {})
+    local allowed = {}
+    for _i, book in ipairs(result and result.books or {}) do
+        if book.bookId then
+            allowed[Content.book_dir_name(book.bookId)] = {
+                book_id = book.bookId,
+                title = book.title,
+                author = book.author,
+            }
+        end
+    end
+    return allowed
+end
+
+function CacheAdmin:confirmScanLocalCache()
+    if not self.settings:is_api_configured() then
+        self.ui_host:showInfo(_("Scanning requires the official API key to match folders against your WeRead shelf."))
+        return
+    end
+    self.ui_host:runOnlineTask(_("Scan and match local books"), function()
+        self.ui_host:showBusy(_("Scanning local cache..."))
+        local ok, allowed = pcall(function()
+            return self:fetchShelfAllowedMap()
+        end)
+        if not ok then
+            self.ui_host:closeBusy()
+            logger.err(LOG_MODULE, "scan shelf fetch failed:", log_error(allowed))
+            self.ui_host:showInfo(T(_("%1 failed:\n%2"), _("Scan and match local books"), display_error(allowed)))
+            return
+        end
+        local added, updated = self:scanLocalCache(self.settings.cache_dir, allowed)
+        self.ui_host:closeBusy()
+        self:refreshCacheManagement(T(_("Scan complete. %1 added, %2 updated."),
+            tostring(added), tostring(updated)))
+    end)
+end
+
+-- After the download directory changes, offer to register untracked items
+-- already sitting in the new directory (e.g. manually copied in), as well as
+-- known books whose stored paths became stale and need rebinding to the files
+-- found here. base_message is shown when there is nothing to import or the user
+-- skips. Importing requires matching against the shelf, so without an API key
+-- or network the scan is silently skipped; it can be run later from Cache
+-- management.
+function CacheAdmin:offerScanNewDir(new_dir, base_message)
+    if not self.settings:is_api_configured() or not self.ui_host:isNetworkOnline() then
+        self.ui_host:showInfo(base_message)
+        return
+    end
+    self.ui_host:runOnlineTask(_("Scan and match local books"), function()
+        local ok, allowed = pcall(function()
+            return self:fetchShelfAllowedMap()
+        end)
+        if not ok then
+            logger.warn(LOG_MODULE, "skip scan, shelf fetch failed:", log_error(allowed))
+            self.ui_host:showInfo(base_message)
+            return
+        end
+        local pending_added, pending_updated = self:scanLocalCache(new_dir, allowed, true)
+        if pending_added + pending_updated == 0 then
+            self.ui_host:showInfo(base_message)
+            return
+        end
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Found %1 new and %2 outdated item(s) in the new directory. Import them?"),
+                tostring(pending_added), tostring(pending_updated)),
+            ok_text = _("Import"),
+            ok_callback = function()
+                local added, updated = self:scanLocalCache(new_dir, allowed)
+                self.ui_host:showInfo(T(_("Imported %1 new and %2 updated item(s)."), tostring(added), tostring(updated)))
+            end,
+            cancel_text = _("Skip"),
+            cancel_callback = function()
+                self.ui_host:showInfo(base_message)
+            end,
+        })
+    end)
+end
+
+function CacheAdmin:confirmClearBookCache(book_id, title, on_cleared)
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Clear cache for \"%1\"?"), title),
+        ok_text = _("Clear"),
+        ok_callback = function()
+            self:clearBookCache(book_id)
+            if on_cleared then
+                on_cleared()
+                self.ui_host:showTransientInfo(_("Cache cleared"))
+            else
+                self:refreshCacheManagement(_("Cache cleared"))
+            end
+        end,
+    })
+end
+
+function CacheAdmin:clearBookCache(book_id)
+    local books = self.settings:get("books", {})
+    local cache_dir = Content.book_resolved_dir(self.settings, book_id, books[book_id])
+    os.execute("rm -rf " .. string.format("%q", cache_dir))
+    if books[book_id] then
+        books[book_id] = nil
+        self.settings:set("books", books)
+        self.settings:flush()
+    end
+    self.plugin:refreshShelfCacheIndicators()
+end
+
+function CacheAdmin:clearAllMPCache()
+    -- Delete each MP book's real directory (which may sit under an old download
+    -- root) rather than scanning only the current cache_dir, and only touch
+    -- plugin-owned entries tracked in the books table.
+    local books = self.settings:get("books", {})
+    for book_id, book in pairs(books) do
+        if WeRead.is_mp_book(book_id) then
+            os.execute("rm -rf " .. string.format("%q", Content.book_resolved_dir(self.settings, book_id, book)))
+            books[book_id] = nil
+        end
+    end
+    self.settings:set("books", books)
+    self.settings:flush()
+    self.plugin:refreshShelfCacheIndicators()
+end
+
+function CacheAdmin:clearAllCache()
+    local books = self.settings:get("books", {})
+    for book_id, book in pairs(books) do
+        os.execute("rm -rf " .. string.format("%q", Content.book_resolved_dir(self.settings, book_id, book)))
+    end
+    self.settings:set("books", {})
+    self.settings:flush()
+    self.plugin:refreshShelfCacheIndicators()
+end
+
+return CacheAdmin

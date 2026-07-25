@@ -8,20 +8,21 @@ local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local logger = require("logger")
 local Menu = require("ui/widget/menu")
-local PathChooser = require("ui/widget/pathchooser")
 local time = require("ui/time")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local T = require("ffi/util").template
 
+local Account = require("lib.account")
 local Annotations = require("lib.annotations")
 local BookIndex = require("lib.book_index")
+local CacheAdmin = require("lib.cache_admin")
 local Client = require("lib.client")
 local Content = require("lib.content")
 local Downloader = require("lib.downloader")
 local EndOfBookDialog = require("ui.end_of_book_dialog")
 local I18n = require("lib.i18n")
-local Scan = require("lib.scan")
+local ProgressSync = require("lib.progress_sync")
 local QRLogin = require("lib.qr_login")
 local ReadReport = require("lib.read_report")
 local ReadStats = require("lib.read_stats")
@@ -77,7 +78,7 @@ function WeReadPlugin:init()
         refresh_shelf   = function() self:refreshShelfCacheIndicators() end,
         open_file       = function(path) self.ui_host:openFile(path) end,
         safe_callback   = function(label, fn) return self.ui_host:safeCallback(label, fn) end,
-        require_login   = function(cookie, api_key) return self:requireLogin(cookie, api_key) end,
+        require_login   = function(cookie, api_key) return self.account:requireLogin(cookie, api_key) end,
         run_online_task = function(label, fn) self.ui_host:runOnlineTask(label, fn) end,
     }
     self:migrateLegacyBookData()
@@ -98,6 +99,9 @@ function WeReadPlugin:init()
             return self.ui_host:isNetworkConnected()
         end,
     }
+    self.account = Account:new(self)
+    self.cache_admin = CacheAdmin:new(self)
+    self.progress_sync = ProgressSync:new(self)
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
     local read_report = self.settings:get("read_report")
@@ -187,7 +191,7 @@ function WeReadPlugin:getMainMenuItems()
                 self.ui_host:setLoginMenu(touchmenu_instance)
                 local account = self.settings:get("account", {})
                 if account.login_method == "qr" and tonumber(account.login_time or 0) > 0 then
-                    self:showAccountStatus()
+                    self.account:showAccountStatus()
                 else
                     self.qr_login:start()
                 end
@@ -208,7 +212,7 @@ function WeReadPlugin:getMainMenuItems()
         {
             text = _("Reading time report"),
             sub_item_table_func = function()
-                if not self:requireLogin(true, true) then
+                if not self.account:requireLogin(true, true) then
                     return {}
                 end
                 return self:getReadReportMenuItems()
@@ -286,13 +290,13 @@ function WeReadPlugin:getSettingsMenuItems()
                     {
                         text = _("Scan and match local books"),
                         callback = self.ui_host:safeCallback(_("Scan and match local books"), function()
-                            self:confirmScanLocalCache()
+                            self.cache_admin:confirmScanLocalCache()
                         end),
                     },
                     {
                         text = _("Cache cleanup"),
                         callback = self.ui_host:safeCallback(_("Cache cleanup"), function()
-                            self:showCacheManagement()
+                            self.cache_admin:showCacheManagement()
                         end),
                     },
                     {
@@ -301,7 +305,7 @@ function WeReadPlugin:getSettingsMenuItems()
                         end,
                         keep_menu_open = true,
                         callback = self.ui_host:safeCallback(_("Cache directory"), function(touchmenu_instance)
-                            self:showDownloadDirPicker(touchmenu_instance)
+                            self.cache_admin:showDownloadDirPicker(touchmenu_instance)
                         end),
                     },
                 }
@@ -419,21 +423,21 @@ function WeReadPlugin:getSettingsMenuItems()
                     {
                         text = _("Account status"),
                         callback = self.ui_host:safeCallback(_("Account status"), function()
-                            self:showAccountStatus()
+                            self.account:showAccountStatus()
                         end),
                     },
                     {
                         text = _("Renew cookie now"),
                         keep_menu_open = true,
                         callback = self.ui_host:safeCallback(_("Renew cookie now"), function()
-                            self:renewCookieWithUI()
+                            self.account:renewCookieWithUI()
                         end),
                     },
                     {
                         text = _("Clear account data"),
                         keep_menu_open = true,
                         callback = self.ui_host:safeCallback(_("Clear account data"), function()
-                            self:confirmClearAccount()
+                            self.account:confirmClearAccount()
                         end),
                     },
                 }
@@ -453,168 +457,6 @@ function WeReadPlugin:setMPImageDownload(enabled)
         "target=mp",
         "enabled=", tostring(cache.download_mp_images)
     )
-end
-
--- Returns true if the directory is usable (creatable and writable), else false + message.
-function WeReadPlugin:validateDownloadDir(path)
-    local lfs = require("libs/libkoreader-lfs")
-    if type(path) ~= "string" or path == "" then
-        return false, _("Invalid path.")
-    end
-    if not lfs.attributes(path, "mode") then
-        os.execute("mkdir -p " .. string.format("%q", path))
-        if not lfs.attributes(path, "mode") then
-            return false, _("Directory does not exist and could not be created.")
-        end
-    end
-    local test_file = path .. "/.weread_write_test"
-    local f = io.open(test_file, "w")
-    if not f then
-        return false, _("Directory is not writable.")
-    end
-    f:close()
-    os.remove(test_file)
-    return true
-end
-
-function WeReadPlugin:showDownloadDirPicker(touchmenu_instance)
-    local current = self.settings:get_download_dir()
-    local path_chooser = PathChooser:new{
-        select_directory = true,
-        select_file = false,
-        path = current,
-        onConfirm = function(path)
-            local ok, err = self:validateDownloadDir(path)
-            if not ok then
-                self.ui_host:showInfo(T(_("Cannot use this directory: %1"), err))
-                return
-            end
-            local old_dir = self.settings:get_download_dir()
-            self.settings:set_download_dir(path)
-            logger.info(LOG_MODULE, "download directory changed:", path)
-            if touchmenu_instance then
-                touchmenu_instance:updateItems()
-            end
-            self:offerMoveBooksToNewDir(old_dir, path)
-        end,
-    }
-    UIManager:show(path_chooser)
-end
-
--- After the download directory changes, offer to move already-cached books from
--- their old locations into the new directory. Without this, old files stay behind
--- as orphans (still reachable via the stored paths, but not under the new root).
-function WeReadPlugin:offerMoveBooksToNewDir(old_dir, new_dir)
-    if old_dir == new_dir then
-        self:offerScanNewDir(new_dir, T(_("Download directory set to:\n%1"), new_dir))
-        return
-    end
-    local lfs = require("libs/libkoreader-lfs")
-    local books = self.settings:get("books", {})
-    local movable = {}
-    for book_id, book in pairs(books) do
-        local src = Content.book_resolved_dir(self.settings, book_id, book)
-        local dst = Content.book_cache_dir(self.settings, book_id)
-        if src ~= dst then
-            local attr = lfs.attributes(src)
-            if attr and attr.mode == "directory" then
-                table.insert(movable, { book_id = book_id, src = src, dst = dst })
-            end
-        end
-    end
-    if #movable == 0 then
-        self:offerScanNewDir(new_dir, T(_("Download directory set to:\n%1"), new_dir))
-        return
-    end
-    UIManager:show(ConfirmBox:new{
-        text = T(_("Download directory changed. Move %1 cached book(s) to the new location?"), tostring(#movable)),
-        ok_text = _("Move"),
-        ok_callback = function()
-            self:moveBooksToNewDir(movable, new_dir)
-        end,
-        cancel_text = _("Keep"),
-        cancel_callback = function()
-            self:offerScanNewDir(new_dir, T(_("Download directory set to:\n%1\nExisting downloads stay in the old location."), new_dir))
-        end,
-    })
-end
-
-function WeReadPlugin:moveBooksToNewDir(movable, new_dir)
-    self.ui_host:showBusy(_("Moving cached books..."))
-    UIManager:scheduleIn(0.1, function()
-        local books = self.settings:get("books", {})
-        local moved, skipped, failed = 0, 0, 0
-        for _i, m in ipairs(movable) do
-            local ok, reason = self:moveBookDir(m.src, m.dst)
-            if ok then
-                local book = books[m.book_id]
-                if book then
-                    book.cache_dir = m.dst
-                    book.cached_file = self:remapCachedPath(book.cached_file, m.dst)
-                    if type(book.cached_chapters) == "table" then
-                        for uid, path in pairs(book.cached_chapters) do
-                            book.cached_chapters[uid] = self:remapCachedPath(path, m.dst)
-                        end
-                    end
-                end
-                moved = moved + 1
-            elseif reason == "target_exists" then
-                skipped = skipped + 1
-                logger.warn(LOG_MODULE, "skip move, target exists:", m.dst)
-            else
-                failed = failed + 1
-                logger.err(LOG_MODULE, "move book cache failed:", m.src, "->", m.dst)
-            end
-        end
-        self.settings:set("books", books)
-        self.settings:flush()
-        self.ui_host:closeBusy()
-        local message
-        if skipped == 0 and failed == 0 then
-            message = T(_("Moved %1 book(s) to:\n%2"), tostring(moved), new_dir)
-        else
-            message = T(_("Moved %1 book(s). %2 skipped (target already exists), %3 failed. These stay in the old location."), tostring(moved), tostring(skipped), tostring(failed))
-        end
-        self:offerScanNewDir(new_dir, message)
-    end)
-end
-
--- Move one book directory to dst. Uses `mv`, which (unlike os.rename) handles
--- moves across filesystems, e.g. internal storage to an SD card. Returns
--- true on success, or false plus a reason ("target_exists" / "move_failed").
-function WeReadPlugin:moveBookDir(src, dst)
-    if src == dst then
-        return true
-    end
-    local lfs = require("libs/libkoreader-lfs")
-    if lfs.attributes(dst) then
-        -- The target already exists. Since the new directory is user-selected, it
-        -- may be unrelated user data that only happens to share the sanitized name.
-        -- Never delete it; leave the book in its old location instead.
-        return false, "target_exists"
-    end
-    local parent = dst:match("^(.*)/[^/]+$")
-    if parent then
-        os.execute("mkdir -p " .. string.format("%q", parent))
-    end
-    local status = os.execute("mv -f " .. string.format("%q", src) .. " " .. string.format("%q", dst))
-    if status == true or status == 0 then
-        return true
-    end
-    return false, "move_failed"
-end
-
--- Rewrite a stored absolute file path to sit under the new book directory,
--- keeping the original filename.
-function WeReadPlugin:remapCachedPath(path, dst)
-    if type(path) ~= "string" then
-        return path
-    end
-    local name = path:match("[^/]+$")
-    if not name then
-        return path
-    end
-    return dst .. "/" .. name
 end
 
 local SHELF_SORT_OPTIONS = {
@@ -781,355 +623,6 @@ function WeReadPlugin:shelfToolbarItems(with_filters, refresh)
     return items
 end
 
-function WeReadPlugin:showCacheManagement()
-    local lfs = require("libs/libkoreader-lfs")
-    local books = self.settings:get("books", {})
-    local items = {}
-    local entries = {}
-    local seen_dirs = {}
-    local total_size = 0
-    local mp_total_size = 0
-
-    local function directory_stats(path)
-        local size = 0
-        local file_count = 0
-        local ok, iter, dir_obj = pcall(lfs.dir, path)
-        if not ok then
-            return size, file_count
-        end
-        for entry in iter, dir_obj do
-            if entry ~= "." and entry ~= ".." then
-                local child = path .. "/" .. entry
-                local attr = lfs.attributes(child)
-                if attr and attr.mode == "file" then
-                    size = size + (attr.size or 0)
-                    file_count = file_count + 1
-                elseif attr and attr.mode == "directory" then
-                    local child_size, child_count = directory_stats(child)
-                    size = size + child_size
-                    file_count = file_count + child_count
-                end
-            end
-        end
-        return size, file_count
-    end
-
-    local function add_cache_entry(book_id, title, book_dir)
-        if seen_dirs[book_dir] then
-            return
-        end
-        seen_dirs[book_dir] = true
-        local size, file_count = directory_stats(book_dir)
-        if file_count == 0 then
-            return
-        end
-        local is_mp = WeRead.is_mp_book(book_id)
-        total_size = total_size + size
-        if is_mp then
-            mp_total_size = mp_total_size + size
-        end
-        table.insert(entries, {
-            book_id = book_id,
-            title = title or book_id,
-            size = size,
-            file_count = file_count,
-            is_mp = is_mp,
-        })
-    end
-
-    -- Only list plugin-owned entries tracked in the books table. Scanning the
-    -- filesystem would list unrelated subfolders when cache_dir is a user-selected
-    -- library directory, and deleting one would rm -rf a non-WeRead folder.
-    for book_id, book in pairs(books) do
-        add_cache_entry(book_id, book.title, Content.book_resolved_dir(self.settings, book_id, book))
-    end
-
-    table.sort(entries, function(a, b)
-        if a.is_mp ~= b.is_mp then
-            return a.is_mp
-        end
-        return tostring(a.title):lower() < tostring(b.title):lower()
-    end)
-
-    local total_str = total_size < 1024 * 1024
-        and string.format("%.0f KB", total_size / 1024)
-        or string.format("%.1f MB", total_size / 1024 / 1024)
-    local mp_total_str = mp_total_size < 1024 * 1024
-        and string.format("%.0f KB", mp_total_size / 1024)
-        or string.format("%.1f MB", mp_total_size / 1024 / 1024)
-    table.insert(items, {
-        text = T(_("[Cleanup] Clear all public account cache (%1)"), mp_total_str),
-        callback = self.ui_host:safeCallback(_("Clear all public account cache"), function()
-            UIManager:show(ConfirmBox:new{
-                text = _("Clear all public account cache? Downloaded articles and cached article lists will be deleted."),
-                ok_text = _("Clear"),
-                ok_callback = function()
-                    self:clearAllMPCache()
-                    self:refreshCacheManagement(_("Public account cache cleared"))
-                end,
-            })
-        end),
-    })
-    table.insert(items, {
-        text = T(_("[Cleanup] Clear all cache (%1)"), total_str),
-        separator = true,
-        callback = self.ui_host:safeCallback(_("Clear all cache"), function()
-            UIManager:show(ConfirmBox:new{
-                text = _("Clear all cache? Downloaded books and articles will be deleted."),
-                ok_text = _("Clear"),
-                ok_callback = function()
-                    self:clearAllCache()
-                    self:refreshCacheManagement(_("Cache cleared"))
-                end,
-            })
-        end),
-    })
-
-    for entry_index, entry in ipairs(entries) do
-        local size_str = entry.size < 1024 * 1024
-            and string.format("%.0f KB", entry.size / 1024)
-            or string.format("%.1f MB", entry.size / 1024 / 1024)
-        table.insert(items, {
-            text = entry.title,
-            post_text = T(_("%1 files, %2"), tostring(entry.file_count), size_str),
-            mandatory = entry.is_mp and _("Public Account") or "",
-            callback = self.ui_host:safeCallback(entry.title, function()
-                self:confirmClearBookCache(entry.book_id, entry.title)
-            end),
-        })
-    end
-
-    self.cache_menu = self.ui_host:showList(_("Cache management"), items, _("No cached items"))
-end
-
-function WeReadPlugin:refreshCacheManagement(message)
-    if self.cache_menu then
-        UIManager:close(self.cache_menu)
-        self.cache_menu = nil
-    end
-    self:showCacheManagement()
-    if message then
-        self.ui_host:showTransientInfo(message)
-    end
-end
-
--- Register manually copied content under a download root into the books table.
--- Only directories whose name matches a shelf book id in `allowed` are imported
--- (see lib/scan.lua), so unrelated folders in a user-selected download dir can
--- never be registered and later removed by cache cleanup.
-function WeReadPlugin:scanLocalCache(root, allowed, dry_run)
-    local lfs = require("libs/libkoreader-lfs")
-    local books = self.settings:get("books", {})
-    local added, updated = Scan.scan_root({
-        root = root,
-        fs = lfs,
-        books = books,
-        allowed = allowed,
-        is_mp = WeRead.is_mp_book,
-        dry_run = dry_run,
-        now = os.time(),
-    })
-    if not dry_run then
-        self.settings:set("books", books)
-        self.settings:flush()
-    end
-    return added, updated
-end
-
--- Build the set of importable directory names from the user's WeRead shelf.
--- Must be called from an online context; raises on API failure.
-function WeReadPlugin:fetchShelfAllowedMap()
-    local result = self.client:gateway("/shelf/sync", {})
-    local allowed = {}
-    for _i, book in ipairs(result and result.books or {}) do
-        if book.bookId then
-            allowed[Content.book_dir_name(book.bookId)] = {
-                book_id = book.bookId,
-                title = book.title,
-                author = book.author,
-            }
-        end
-    end
-    return allowed
-end
-
-function WeReadPlugin:confirmScanLocalCache()
-    if not self.settings:is_api_configured() then
-        self.ui_host:showInfo(_("Scanning requires the official API key to match folders against your WeRead shelf."))
-        return
-    end
-    self.ui_host:runOnlineTask(_("Scan and match local books"), function()
-        self.ui_host:showBusy(_("Scanning local cache..."))
-        local ok, allowed = pcall(function()
-            return self:fetchShelfAllowedMap()
-        end)
-        if not ok then
-            self.ui_host:closeBusy()
-            logger.err(LOG_MODULE, "scan shelf fetch failed:", log_error(allowed))
-            self.ui_host:showInfo(T(_("%1 failed:\n%2"), _("Scan and match local books"), display_error(allowed)))
-            return
-        end
-        local added, updated = self:scanLocalCache(self.settings.cache_dir, allowed)
-        self.ui_host:closeBusy()
-        self:refreshCacheManagement(T(_("Scan complete. %1 added, %2 updated."),
-            tostring(added), tostring(updated)))
-    end)
-end
-
--- After the download directory changes, offer to register untracked items
--- already sitting in the new directory (e.g. manually copied in), as well as
--- known books whose stored paths became stale and need rebinding to the files
--- found here. base_message is shown when there is nothing to import or the user
--- skips. Importing requires matching against the shelf, so without an API key
--- or network the scan is silently skipped; it can be run later from Cache
--- management.
-function WeReadPlugin:offerScanNewDir(new_dir, base_message)
-    if not self.settings:is_api_configured() or not self.ui_host:isNetworkOnline() then
-        self.ui_host:showInfo(base_message)
-        return
-    end
-    self.ui_host:runOnlineTask(_("Scan and match local books"), function()
-        local ok, allowed = pcall(function()
-            return self:fetchShelfAllowedMap()
-        end)
-        if not ok then
-            logger.warn(LOG_MODULE, "skip scan, shelf fetch failed:", log_error(allowed))
-            self.ui_host:showInfo(base_message)
-            return
-        end
-        local pending_added, pending_updated = self:scanLocalCache(new_dir, allowed, true)
-        if pending_added + pending_updated == 0 then
-            self.ui_host:showInfo(base_message)
-            return
-        end
-        UIManager:show(ConfirmBox:new{
-            text = T(_("Found %1 new and %2 outdated item(s) in the new directory. Import them?"),
-                tostring(pending_added), tostring(pending_updated)),
-            ok_text = _("Import"),
-            ok_callback = function()
-                local added, updated = self:scanLocalCache(new_dir, allowed)
-                self.ui_host:showInfo(T(_("Imported %1 new and %2 updated item(s)."), tostring(added), tostring(updated)))
-            end,
-            cancel_text = _("Skip"),
-            cancel_callback = function()
-                self.ui_host:showInfo(base_message)
-            end,
-        })
-    end)
-end
-
-function WeReadPlugin:confirmClearBookCache(book_id, title, on_cleared)
-    UIManager:show(ConfirmBox:new{
-        text = T(_("Clear cache for \"%1\"?"), title),
-        ok_text = _("Clear"),
-        ok_callback = function()
-            self:clearBookCache(book_id)
-            if on_cleared then
-                on_cleared()
-                self.ui_host:showTransientInfo(_("Cache cleared"))
-            else
-                self:refreshCacheManagement(_("Cache cleared"))
-            end
-        end,
-    })
-end
-
-function WeReadPlugin:clearBookCache(book_id)
-    local books = self.settings:get("books", {})
-    local cache_dir = Content.book_resolved_dir(self.settings, book_id, books[book_id])
-    os.execute("rm -rf " .. string.format("%q", cache_dir))
-    if books[book_id] then
-        books[book_id] = nil
-        self.settings:set("books", books)
-        self.settings:flush()
-    end
-    self:refreshShelfCacheIndicators()
-end
-
-function WeReadPlugin:clearAllMPCache()
-    -- Delete each MP book's real directory (which may sit under an old download
-    -- root) rather than scanning only the current cache_dir, and only touch
-    -- plugin-owned entries tracked in the books table.
-    local books = self.settings:get("books", {})
-    for book_id, book in pairs(books) do
-        if WeRead.is_mp_book(book_id) then
-            os.execute("rm -rf " .. string.format("%q", Content.book_resolved_dir(self.settings, book_id, book)))
-            books[book_id] = nil
-        end
-    end
-    self.settings:set("books", books)
-    self.settings:flush()
-    self:refreshShelfCacheIndicators()
-end
-
-function WeReadPlugin:clearAllCache()
-    local books = self.settings:get("books", {})
-    for book_id, book in pairs(books) do
-        os.execute("rm -rf " .. string.format("%q", Content.book_resolved_dir(self.settings, book_id, book)))
-    end
-    self.settings:set("books", {})
-    self.settings:flush()
-    self:refreshShelfCacheIndicators()
-end
-
-function WeReadPlugin:requireLogin(require_cookie, require_api_key)
-    local missing_cookie = require_cookie and not self.settings:is_cookie_configured()
-    local missing_api_key = require_api_key and not self.settings:is_api_configured()
-    if not missing_cookie and not missing_api_key then
-        return true
-    end
-    self.ui_host:showTransientInfo(_("Please scan the QR code to log in first."), 2)
-    UIManager:scheduleIn(0.2, function()
-        self.qr_login:start()
-    end)
-    return false
-end
-
-function WeReadPlugin:renewCookieWithUI()
-    if not self:requireLogin(true, false) then
-        return
-    end
-    self.ui_host:runNetworkAction(_("Renew cookie"), function()
-        self.client:renew_cookie()
-        logger.info(LOG_MODULE, "cookie renewed")
-        return _("WeRead cookie renewed.")
-    end)
-end
-
-function WeReadPlugin:showAccountStatus()
-    local account = self.settings:get("account", {})
-    local account_name = type(account.name) == "string" and account.name or ""
-    if account_name == "" then
-        account_name = (self.settings:is_cookie_configured() or self.settings:is_api_configured())
-            and _("Unknown account") or _("Not logged in")
-    end
-    local login_method = account.login_method == "qr" and _("QR login") or _("Unknown")
-    local cookie_status = self.settings:is_cookie_configured() and _("configured") or _("missing")
-    local api_status = self.settings:is_api_configured() and _("configured") or _("missing")
-    self.ui_host:showInfo(T(
-        _("Account: %1\nLogin method: %2\nCookie: %3\nOfficial API key: %4\nCache directory:\n%5"),
-        account_name,
-        login_method,
-        cookie_status,
-        api_status,
-        BD.dirpath(self.settings.cache_dir)
-    ))
-end
-
-function WeReadPlugin:confirmClearAccount()
-    UIManager:show(ConfirmBox:new{
-        text = _("Clear WeRead cookie and API key? Cached books will remain."),
-        ok_text = _("Clear"),
-        ok_callback = self.ui_host:safeCallback(_("Clear"), function()
-            self.qr_login:cancel()
-            self.read_report:stop("account_cleared")
-            self.settings:reset_account()
-            self.ui_host:refreshLoginMenu()
-            self.ui_host:showInfo(_("WeRead account data cleared."))
-        end),
-    })
-end
-
 function WeReadPlugin:getReadReportMenuItems()
     local rr = self.settings:get("read_report")
     return {
@@ -1272,7 +765,7 @@ function WeReadPlugin:detectWeReadBook()
 end
 
 function WeReadPlugin:showReadReportBookPicker()
-    if not self:requireLogin(true, true) then
+    if not self.account:requireLogin(true, true) then
         return
     end
     self.ui_host:showBusy(_("Loading bookshelf..."))
@@ -1326,7 +819,7 @@ function WeReadPlugin:showReadReportBookPicker()
 end
 
 function WeReadPlugin:showReadStats()
-    if not self:requireLogin(false, true) then
+    if not self.account:requireLogin(false, true) then
         return
     end
     -- Open on the monthly tab by default.
@@ -1367,7 +860,7 @@ function WeReadPlugin:loadReadStats(mode, base_time, old_view)
 end
 
 function WeReadPlugin:showBookshelf()
-    if not self:requireLogin(true, true) then
+    if not self.account:requireLogin(true, true) then
         return
     end
     self.ui_host:showBusy(_("Loading bookshelf..."))
@@ -1468,7 +961,7 @@ function WeReadPlugin:refreshShelfCacheIndicators()
 end
 
 function WeReadPlugin:showBookRecord(book)
-    if not self:requireLogin(true, true) then
+    if not self.account:requireLogin(true, true) then
         return
     end
     local books = self.settings:get("books", {})
@@ -1594,7 +1087,7 @@ function WeReadPlugin:showBookMenu(book)
             table.insert(items, {
                 text = _("Clear book cache"),
                 callback = self.ui_host:safeCallback(_("Clear book cache"), function()
-                    self:confirmClearBookCache(book_id, book.title or book_id, function()
+                    self.cache_admin:confirmClearBookCache(book_id, book.title or book_id, function()
                         book.cached_file = nil
                         book.cached_chapters = nil
                         book.cache_dir = nil
@@ -1673,7 +1166,7 @@ end
 
 function WeReadPlugin:showMPAccount(book)
     self:rememberMPAccount(book)
-    if not self:requireLogin(true, false) then
+    if not self.account:requireLogin(true, false) then
         return
     end
     local book_id = book.book_id or book.bookId
@@ -1706,7 +1199,7 @@ function WeReadPlugin:rememberMPAccount(book)
 end
 
 function WeReadPlugin:fetchMPArticles(book)
-    if not self:requireLogin(true, false) then
+    if not self.account:requireLogin(true, false) then
         return
     end
     self.ui_host:runOnlineTask(_("Loading articles..."), function()
@@ -1799,7 +1292,7 @@ function WeReadPlugin:showMPArticleList(book, articles)
 end
 
 function WeReadPlugin:downloadMPArticleAndRead(book, article)
-    if not self:requireLogin(true, false) then
+    if not self.account:requireLogin(true, false) then
         return
     end
     self.ui_host:runOnlineTask(_("Download article and read"), function()
@@ -1863,7 +1356,7 @@ function WeReadPlugin:loadChapters(book, callback, force_refresh)
             return
         end
     end
-    if not self:requireLogin(true, false) then
+    if not self.account:requireLogin(true, false) then
         return
     end
     self.ui_host:runOnlineTask(_("Loading chapter list..."), function()
@@ -1985,19 +1478,8 @@ function WeReadPlugin:confirmAndDownloadChapters(book, chapters, suffix, options
     UIManager:show(confirm)
 end
 
-function WeReadPlugin:pullProgressWithUI(book_id)
-    if not self:requireLogin(true, true) then
-        return
-    end
-    self.ui_host:runNetworkAction(_("Pull progress"), function()
-        local result = self.client:get_progress(book_id)
-        local progress = result and result.book and result.book.progress or 0
-        return T(_("Remote progress: %1%"), tostring(progress))
-    end)
-end
-
 function WeReadPlugin:showSearch()
-    if not self:requireLogin(true, true) then
+    if not self.account:requireLogin(true, true) then
         return
     end
     local dialog
@@ -2063,69 +1545,8 @@ function WeReadPlugin:searchWithUI(keyword)
     end)
 end
 
-function WeReadPlugin:showPasteReaderURL()
-    local dialog
-    dialog = InputDialog:new{
-        title = _("Paste WeRead reader URL"),
-        input = "https://weread.qq.com/web/reader/",
-        input_type = "text",
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = self.ui_host:safeCallback(_("Cancel"), function()
-                        UIManager:close(dialog)
-                    end),
-                },
-                {
-                    text = _("Parse"),
-                    is_enter_default = true,
-                    callback = self.ui_host:safeCallback(_("Parse"), function()
-                        local url = dialog:getInputText()
-                        UIManager:close(dialog)
-                        self:parseReaderURLWithUI(url)
-                    end),
-                },
-            },
-        },
-    }
-    self.ui_host:showInputDialog(dialog)
-end
-
-function WeReadPlugin:parseReaderURLWithUI(url)
-    if not self:requireLogin(true, false) then
-        return
-    end
-    self.ui_host:runNetworkAction(_("Parse reader URL"), function()
-        local html = self.client:get_text(url, { referer = url })
-        local book_id = html:match([["bookId"%s*:%s*"([^"]+)"]]) or html:match([["bookId"%s*:%s*(%d+)]])
-        local title = html:match([["title"%s*:%s*"([^"]+)"]]) or _("Unknown title")
-        local psvts = html:match([["psvts"%s*:%s*"([^"]+)"]])
-        local pclts = html:match([["pclts"%s*:%s*"([^"]+)"]])
-        local token = html:match([["token"%s*:%s*"([^"]+)"]])
-        if not book_id then
-            return _("Reader HTML loaded, but bookId was not found.")
-        end
-        local books = self.settings:get("books", {})
-        local record = books[book_id] or {}
-        record.book_id = book_id
-        record.title = title
-        record.reader_url = url
-        record.psvts = psvts
-        record.pclts = pclts
-        record.token = token
-        record.updated_at = os.time()
-        books[book_id] = record
-        self.settings:set("books", books)
-        self.settings:flush()
-        return T(_("Reader URL parsed.\nBook: %1\nbookId: %2"), title, book_id)
-    end)
-end
-
-
 function WeReadPlugin:showCurrentBookDetails()
-    if not self:requireLogin(true, true) then
+    if not self.account:requireLogin(true, true) then
         return
     end
     local book_id = self:detectWeReadBook()
@@ -2139,48 +1560,11 @@ function WeReadPlugin:showCurrentBookDetails()
 end
 
 function WeReadPlugin:onShowWeRead()
-    self:showAccountStatus()
+    self.account:showAccountStatus()
 end
 
 function WeReadPlugin:onWeReadSyncProgress()
-    if not self:requireLogin(true, false) then
-        return
-    end
-    local books = self.settings:get("books", {})
-    local book_id, book
-    for id, item in pairs(books) do
-        book_id, book = id, item
-        break
-    end
-    if not book_id then
-        self.ui_host:showInfo(_("Parse a WeRead reader URL before testing progress sync."))
-        return
-    end
-    local payload = WeRead.make_read_payload{
-        book_id = book_id,
-        chapter_uid = book.chapter_uid or 0,
-        chapter_idx = book.chapter_idx or 0,
-        chapter_offset = book.chapter_offset or 0,
-        progress = book.progress or 0,
-        summary = book.summary or "",
-        app_id = book.app_id,
-        psvts = book.psvts,
-        pclts = book.pclts,
-        token = book.token,
-    }
-    UIManager:show(ConfirmBox:new{
-        text = T(_("Upload local progress to WeRead?\n\nBook: %1\nProgress: %2%%\nChapter offset: %3"), book.title or book_id, tostring(payload.pr), tostring(payload.co)),
-        ok_text = _("Upload"),
-        ok_callback = self.ui_host:safeCallback(_("Upload"), function()
-            self.ui_host:runNetworkAction(_("Sync progress"), function()
-                local result = self.client:report_read(payload, book.reader_url)
-                if result and result.succ then
-                    return _("WeRead progress synced.")
-                end
-                return _("Progress request sent, but response did not include succ=1.")
-            end)
-        end),
-    })
+    self.progress_sync:uploadCurrentProgress()
 end
 
 -- Runtime CSS that hides underlines and thought stars baked into cached EPUBs.
