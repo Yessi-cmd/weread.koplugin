@@ -468,7 +468,7 @@ function CacheAdmin:clearBookCache(book_id)
         self.settings:set("books", books)
         self.settings:flush()
     end
-    self.plugin:refreshShelfCacheIndicators()
+    self.plugin.shelf:refreshCacheIndicators()
 end
 
 function CacheAdmin:clearAllMPCache()
@@ -484,7 +484,7 @@ function CacheAdmin:clearAllMPCache()
     end
     self.settings:set("books", books)
     self.settings:flush()
-    self.plugin:refreshShelfCacheIndicators()
+    self.plugin.shelf:refreshCacheIndicators()
 end
 
 function CacheAdmin:clearAllCache()
@@ -494,7 +494,7 @@ function CacheAdmin:clearAllCache()
     end
     self.settings:set("books", {})
     self.settings:flush()
-    self.plugin:refreshShelfCacheIndicators()
+    self.plugin.shelf:refreshCacheIndicators()
 end
 
 return CacheAdmin

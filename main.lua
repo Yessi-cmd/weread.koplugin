@@ -1,11 +1,8 @@
 local BD = require("ui/bidi")
-local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Dispatcher = require("dispatcher")
 local Event = require("ui/event")
-local ProgressbarDialog = require("ui/widget/progressbardialog")
 local InfoMessage = require("ui/widget/infomessage")
-local InputDialog = require("ui/widget/inputdialog")
 local logger = require("logger")
 local Menu = require("ui/widget/menu")
 local time = require("ui/time")
@@ -17,18 +14,19 @@ local Account = require("lib.account")
 local Annotations = require("lib.annotations")
 local BookIndex = require("lib.book_index")
 local CacheAdmin = require("lib.cache_admin")
+local Chapters = require("lib.chapters")
 local Client = require("lib.client")
 local Content = require("lib.content")
 local Downloader = require("lib.downloader")
-local EndOfBookDialog = require("ui.end_of_book_dialog")
 local I18n = require("lib.i18n")
+local MPArticles = require("lib.mp_articles")
 local ProgressSync = require("lib.progress_sync")
 local QRLogin = require("lib.qr_login")
 local ReadReport = require("lib.read_report")
 local ReadStats = require("lib.read_stats")
 local ReadStatsView = require("ui.read_stats_view")
 local Settings = require("lib.settings")
-local ShelfSort = require("lib.shelf_sort")
+local Shelf = require("lib.shelf")
 local Thoughts = require("lib.thoughts")
 local UIHost = require("lib.ui_host")
 local Util = require("lib.util")
@@ -45,7 +43,6 @@ local LOG_MODULE = "[WeRead]"
 
 local log_error = Util.log_error
 local display_error = Util.display_error
-local file_exists = Util.file_exists
 
 -- Hard ceilings for the per-session thought caches (both cleared on book close).
 -- On overflow the whole map is dropped; the next tap simply re-renders / re-reads.
@@ -75,7 +72,7 @@ function WeReadPlugin:init()
         show_info       = function(text) self.ui_host:showInfo(text) end,
         show_transient  = function(text, timeout) self.ui_host:showTransientInfo(text, timeout) end,
         refresh_ui      = function() self.ui_host:refreshUI() end,
-        refresh_shelf   = function() self:refreshShelfCacheIndicators() end,
+        refresh_shelf   = function() self.shelf:refreshCacheIndicators() end,
         open_file       = function(path) self.ui_host:openFile(path) end,
         safe_callback   = function(label, fn) return self.ui_host:safeCallback(label, fn) end,
         require_login   = function(cookie, api_key) return self.account:requireLogin(cookie, api_key) end,
@@ -101,7 +98,10 @@ function WeReadPlugin:init()
     }
     self.account = Account:new(self)
     self.cache_admin = CacheAdmin:new(self)
+    self.chapters = Chapters:new(self)
+    self.mp_articles = MPArticles:new(self)
     self.progress_sync = ProgressSync:new(self)
+    self.shelf = Shelf:new(self)
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
     local read_report = self.settings:get("read_report")
@@ -200,13 +200,13 @@ function WeReadPlugin:getMainMenuItems()
         {
             text = _("Bookshelf"),
             callback = self.ui_host:safeCallback(_("Bookshelf"), function()
-                self:showBookshelf()
+                self.shelf:showBookshelf()
             end),
         },
         {
             text = _("Search"),
             callback = self.ui_host:safeCallback(_("Search"), function()
-                self:showSearch()
+                self.shelf:showSearch()
             end),
         },
         {
@@ -248,7 +248,7 @@ function WeReadPlugin:getMainMenuItems()
         table.insert(items, 3, {
             text = _("Book details"),
             callback = self.ui_host:safeCallback(_("Book details"), function()
-                self:showCurrentBookDetails()
+                self.shelf:showCurrentBookDetails()
             end),
         })
         table.insert(items, 4, {
@@ -457,170 +457,6 @@ function WeReadPlugin:setMPImageDownload(enabled)
         "target=mp",
         "enabled=", tostring(cache.download_mp_images)
     )
-end
-
-local SHELF_SORT_OPTIONS = {
-    { key = "time_desc", label = _("Last read time (newest first)") },
-    { key = "time_asc",  label = _("Last read time (oldest first)") },
-    { key = "default",   label = _("Default order") },
-    { key = "name_asc",  label = _("Title A-Z") },
-    { key = "name_desc", label = _("Title Z-A") },
-}
-
-local function shelfSortLabel(sort_key)
-    for _i, opt in ipairs(SHELF_SORT_OPTIONS) do
-        if opt.key == sort_key then
-            return opt.label
-        end
-    end
-    return SHELF_SORT_OPTIONS[1].label
-end
-
-local SHELF_FILTER_OPTIONS = {
-    { dim = "reading",  value = "finished",       label = _("Only show finished books"),       short = _("Finished") },
-    { dim = "reading",  value = "unfinished",     label = _("Only show unfinished books"),     short = _("Unfinished") },
-    { dim = "download", value = "downloaded",     label = _("Only show downloaded books"),     short = _("Downloaded") },
-    { dim = "download", value = "not_downloaded", label = _("Only show not-downloaded books"), short = _("Not downloaded") },
-}
-
-function WeReadPlugin:shelfFilterSummary()
-    local filters = self.shelf_filters
-    local parts = {}
-    for _i, opt in ipairs(SHELF_FILTER_OPTIONS) do
-        if filters[opt.dim] == opt.value then
-            table.insert(parts, opt.short)
-        end
-    end
-    if #parts == 0 then
-        return _("All")
-    end
-    return table.concat(parts, " / ")
-end
-
-function WeReadPlugin:saveShelfFilters()
-    local shelf = self.settings:get("shelf")
-    shelf.filter_reading = self.shelf_filters.reading
-    shelf.filter_download = self.shelf_filters.download
-    self.settings:set("shelf", shelf)
-    self.settings:flush()
-end
-
-function WeReadPlugin:bookMatchesFilters(book, saved_books, downloaded_cache)
-    return ShelfSort.matches_filters(book, self.shelf_filters, function(candidate)
-        return self:isBookDownloaded(candidate, saved_books, downloaded_cache)
-    end)
-end
-
-function WeReadPlugin:showShelfSortOptions(on_sorted)
-    local dialog
-    local current_sort = self.settings:get("shelf").sort_order or "default"
-    local buttons = {}
-    for _i, opt in ipairs(SHELF_SORT_OPTIONS) do
-        table.insert(buttons, {
-            {
-                text = opt.label,
-                checked_func = function()
-                    return opt.key == current_sort
-                end,
-                -- Defer close+refresh so Button's post-tap checkmark repaint runs
-                -- against the still-shown dialog (avoids a ghost label on close).
-                callback = function()
-                    UIManager:nextTick(function()
-                        UIManager:close(dialog)
-                        local shelf = self.settings:get("shelf")
-                        shelf.sort_order = opt.key
-                        self.settings:set("shelf", shelf)
-                        self.settings:flush()
-                        on_sorted()
-                    end)
-                end,
-            },
-        })
-    end
-    dialog = ButtonDialog:new{
-        title = _("Sort by"),
-        title_align = "center",
-        buttons = buttons,
-    }
-    UIManager:show(dialog)
-end
-
-function WeReadPlugin:showShelfFilterOptions(on_changed)
-    local dialog
-    local filters = self.shelf_filters
-    local buttons = {
-        {
-            {
-                text = _("All"),
-                checked_func = function()
-                    return filters.reading == nil and filters.download == nil
-                end,
-                callback = function()
-                    UIManager:nextTick(function()
-                        UIManager:close(dialog)
-                        filters.reading = nil
-                        filters.download = nil
-                        self:saveShelfFilters()
-                        on_changed()
-                    end)
-                end,
-            },
-        },
-    }
-    for _i, opt in ipairs(SHELF_FILTER_OPTIONS) do
-        table.insert(buttons, {
-            {
-                text = opt.label,
-                checked_func = function()
-                    return filters[opt.dim] == opt.value
-                end,
-                callback = function()
-                    UIManager:nextTick(function()
-                        UIManager:close(dialog)
-                        -- Toggle within the dimension: re-tapping clears it, else select.
-                        filters[opt.dim] = (filters[opt.dim] == opt.value) and nil or opt.value
-                        self:saveShelfFilters()
-                        on_changed()
-                    end)
-                end,
-            },
-        })
-    end
-    dialog = ButtonDialog:new{
-        title = _("Filter by"),
-        title_align = "center",
-        buttons = buttons,
-    }
-    UIManager:show(dialog)
-end
-
-function WeReadPlugin:isBookDownloaded(book, saved_books, downloaded_cache)
-    return BookIndex.is_downloaded(
-        book, saved_books or self.settings:get("books", {}), downloaded_cache)
-end
-
-function WeReadPlugin:shelfToolbarItems(with_filters, refresh)
-    local sort_order = self.settings:get("shelf").sort_order
-    local items = {
-        {
-            text = _("Sort"),
-            mandatory = T(_("%1 \u{25BE}"), shelfSortLabel(sort_order)),
-            callback = self.ui_host:safeCallback(_("Sort"), function()
-                self:showShelfSortOptions(refresh)
-            end),
-        },
-    }
-    if with_filters then
-        table.insert(items, {
-            text = _("Filter"),
-            mandatory = T(_("%1 \u{25BE}"), self:shelfFilterSummary()),
-            callback = self.ui_host:safeCallback(_("Filter"), function()
-                self:showShelfFilterOptions(refresh)
-            end),
-        })
-    end
-    items[#items].separator = true -- divide the toolbar rows from the book list
-    return items
 end
 
 function WeReadPlugin:getReadReportMenuItems()
@@ -857,706 +693,6 @@ function WeReadPlugin:loadReadStats(mode, base_time, old_view)
             end,
         })
     end)
-end
-
-function WeReadPlugin:showBookshelf()
-    if not self.account:requireLogin(true, true) then
-        return
-    end
-    self.ui_host:showBusy(_("Loading bookshelf..."))
-    self.ui_host:runOnlineTask(_("Bookshelf"), function()
-        local ok, result = pcall(function()
-            return self.client:gateway("/shelf/sync", {})
-        end)
-        if not ok then
-            self.ui_host:closeBusy()
-            logger.err(LOG_MODULE, "load bookshelf failed:", log_error(result))
-            self.ui_host:showInfo(T(_("Load bookshelf failed:\n%1"), display_error(result)))
-            return
-        end
-        local all_books = result.books or {}
-        local shelf = self.settings:get("shelf")
-        self.shelf_filters = { reading = shelf.filter_reading, download = shelf.filter_download }
-        self.shelf_regular = {}
-        self.shelf_mp = {}
-        for _i, book in ipairs(all_books) do
-            if WeRead.is_mp_book(book.bookId) then
-                table.insert(self.shelf_mp, book)
-            else
-                table.insert(self.shelf_regular, book)
-            end
-        end
-        self.shelf_books = self.shelf_regular
-        self.ui_host:closeBusy()
-        if #self.shelf_mp > 0 then
-            self:showShelfTabs()
-        else
-            self:showShelfPage()
-        end
-    end)
-end
-
-function WeReadPlugin:showShelfPage()
-    local books = self.shelf_books or {}
-    if #books == 0 then
-        self.ui_host:showInfo(_("Your WeRead shelf is empty."))
-        return
-    end
-    local menu, buildItems
-    local function refresh()
-        menu:switchItemTable(nil, buildItems())
-    end
-    buildItems = function()
-        local items = self:shelfToolbarItems(true, refresh)
-        local sorted = ShelfSort.sort_books(books, self.settings:get("shelf").sort_order)
-        local saved_books = self.settings:get("books", {})
-        local downloaded_cache = {}
-        self._shelf_saved_books = saved_books
-        for _i, book in ipairs(sorted) do
-            if self:bookMatchesFilters(book, saved_books, downloaded_cache) then
-                local book_id = book.book_id or book.bookId
-                local is_cached = self:isBookDownloaded(book, saved_books, downloaded_cache)
-                local right_text
-                if book.readUpdateTime and book.readUpdateTime > 0 then
-                    right_text = os.date("%Y-%m-%d", book.readUpdateTime)
-                elseif book.finishReading == 1 then
-                    right_text = _("Done")
-                else
-                    right_text = ""
-                end
-                local function rightStatus(cached)
-                    if cached then
-                        return right_text ~= "" and "✓  " .. right_text or "✓"
-                    end
-                    return right_text
-                end
-                table.insert(items, {
-                    text = book.title or book.bookId or _("Untitled"),
-                    mandatory = rightStatus(is_cached),
-                    mandatory_func = function()
-                        local current = self._shelf_saved_books and self._shelf_saved_books[book_id]
-                        return rightStatus(current and file_exists(current.cached_file))
-                    end,
-                    callback = self.ui_host:safeCallback(book.title or book.bookId or _("Untitled"), function()
-                        self:showBookRecord(book)
-                    end),
-                })
-            end
-        end
-        return items
-    end
-    menu = self.ui_host:showList(_("WeRead Bookshelf"), buildItems(), _("Your WeRead shelf is empty."))
-    self.shelf_menu = menu
-    self._shelf_refresh = refresh
-end
-
-function WeReadPlugin:refreshShelfCacheIndicators()
-    self._shelf_saved_books = self.settings:get("books", {})
-    if self.shelf_menu and self._shelf_refresh then
-        local ok, err = pcall(self._shelf_refresh)
-        if not ok then
-            logger.warn(LOG_MODULE, "refresh shelf cache indicators failed:", log_error(err))
-        end
-    end
-end
-
-function WeReadPlugin:showBookRecord(book)
-    if not self.account:requireLogin(true, true) then
-        return
-    end
-    local books = self.settings:get("books", {})
-    local book_id = book.book_id or book.bookId
-    if WeRead.is_mp_book(book_id) then
-        self:showMPAccount(book)
-        return
-    end
-    if book_id then
-        books[book_id] = books[book_id] or {}
-        books[book_id].book_id = book_id
-        books[book_id].title = book.title
-        books[book_id].author = book.author
-        books[book_id].cover = book.cover
-        books[book_id].updated_at = os.time()
-        self.settings:set("books", books)
-        self.settings:flush()
-    end
-    local saved = books[book_id] or book
-    self.ui_host:showBusy(_("Loading book info..."))
-    self.ui_host:runOnlineTask(_("Book info"), function()
-        local ok, err = pcall(function()
-            local info = self.client:get_book_info(book_id)
-            if info then
-                saved.intro = info.intro
-                saved.publisher = info.publisher
-                saved.isbn = info.isbn
-                saved.wordCount = info.wordCount
-                saved.newRating = info.newRating
-                saved.newRatingCount = info.newRatingCount
-                saved.translator = info.translator
-                saved.categoryName = info.categoryName or info.category
-                books[book_id] = saved
-                self.settings:set("books", books)
-                self.settings:flush()
-            end
-            local progress_result = self.client:get_progress(book_id)
-            if progress_result and progress_result.book then
-                saved.progress = progress_result.book.progress or 0
-            end
-        end)
-        self.ui_host:closeBusy()
-        if not ok then
-            logger.err(LOG_MODULE, "load book info failed:", log_error(err))
-            self.ui_host:showInfo(T(_("%1 failed:\n%2"), _("Book info"), display_error(err)))
-            return
-        end
-        self:showBookMenu(saved)
-    end)
-end
-
-function WeReadPlugin:showBookMenu(book)
-    local book_id = book.book_id or book.bookId
-    if type(book.chapters) ~= "table" then
-        Content.load_catalog_cache(self.client, self.settings, book)
-    end
-    local menu, buildItems
-    local function refresh()
-        if menu then
-            menu:switchItemTable(nil, buildItems())
-        end
-    end
-
-    buildItems = function()
-        local items = {}
-
-        if book.author and book.author ~= "" then
-            table.insert(items, { text = _("Author"), mandatory = book.author })
-        end
-        if book.translator and book.translator ~= "" then
-            table.insert(items, { text = _("Translator"), mandatory = book.translator })
-        end
-        if book.publisher and book.publisher ~= "" then
-            table.insert(items, { text = _("Publisher"), mandatory = book.publisher })
-        end
-        if book.categoryName and book.categoryName ~= "" then
-            table.insert(items, { text = _("Category"), mandatory = book.categoryName })
-        end
-        if book.wordCount and book.wordCount > 0 then
-            local wc = book.wordCount >= 10000
-                and string.format("%.1f%s", book.wordCount / 10000, _("w words"))
-                or tostring(book.wordCount)
-            table.insert(items, { text = _("Word count"), mandatory = wc })
-        end
-        if book.newRating and book.newRating > 0 then
-            local score = string.format("%.1f", book.newRating / 100)
-            local count = book.newRatingCount and tostring(book.newRatingCount) or "0"
-            table.insert(items, { text = _("Rating"), mandatory = T(_("%1 (%2 ratings)"), score, count) })
-        end
-        if book.isbn and book.isbn ~= "" then
-            table.insert(items, { text = "ISBN", mandatory = book.isbn })
-        end
-        if book.progress and book.progress > 0 then
-            table.insert(items, { text = _("Reading progress"), mandatory = tostring(book.progress) .. "%" })
-        end
-        if book.intro and book.intro ~= "" then
-            table.insert(items, {
-                text = _("Introduction"),
-                callback = function()
-                    UIManager:show(InfoMessage:new{ text = book.intro })
-                end,
-            })
-        end
-
-        if #items > 0 then
-            items[#items].separator = true
-        end
-
-        local saved_books = self.settings:get("books", {})
-        local saved = saved_books[book_id]
-        local cached_path = saved and saved.cached_file or book.cached_file
-        local is_cached = file_exists(cached_path)
-        book.cached_file = is_cached and cached_path or nil
-
-        table.insert(items, {
-            text = _("Chapter list"),
-            post_text = book.chapters and T(_("%1 chapters"), tostring(#book.chapters)) or _("Not loaded"),
-            callback = self.ui_host:safeCallback(_("Chapter list"), function()
-                self:showChapterList(book)
-            end),
-        })
-        if is_cached then
-            table.insert(items, {
-                text = _("Clear book cache"),
-                callback = self.ui_host:safeCallback(_("Clear book cache"), function()
-                    self.cache_admin:confirmClearBookCache(book_id, book.title or book_id, function()
-                        book.cached_file = nil
-                        book.cached_chapters = nil
-                        book.cache_dir = nil
-                        book.chapters = nil
-                        refresh()
-                    end)
-                end),
-            })
-        end
-        table.insert(items, {
-            text = _("Open cached book"),
-            post_text = is_cached and _("Cached") or _("Not cached"),
-            enabled_func = function() return is_cached end,
-            callback = self.ui_host:safeCallback(_("Open cached book"), function()
-                self:openCachedBook(book)
-            end),
-        })
-        table.insert(items, {
-            text = _("Download full book"),
-            post_text = _("EPUB"),
-            callback = self.ui_host:safeCallback(_("Download full book"), function()
-                self:confirmDownloadAllChapters(book)
-            end),
-        })
-        return items
-    end
-
-    menu = self.ui_host:showList(book.title or _("Book details"), buildItems(), _("No actions."))
-end
-
-function WeReadPlugin:showShelfTabs()
-    local items = {
-        {
-            text = _("Books"),
-            post_text = T(_("%1 books"), tostring(#self.shelf_regular)),
-            callback = self.ui_host:safeCallback(_("Books"), function()
-                self.shelf_books = self.shelf_regular
-                self:showShelfPage()
-            end),
-        },
-        {
-            text = _("Public Accounts"),
-            post_text = T(_("%1 accounts"), tostring(#self.shelf_mp)),
-            callback = self.ui_host:safeCallback(_("Public Accounts"), function()
-                self:showMPShelfPage()
-            end),
-        },
-    }
-    self.ui_host:showList(_("WeRead Bookshelf"), items, _("Your WeRead shelf is empty."))
-end
-
-function WeReadPlugin:showMPShelfPage()
-    local books = self.shelf_mp or {}
-    if #books == 0 then
-        self.ui_host:showInfo(_("No items."))
-        return
-    end
-    local menu, buildItems
-    local function refresh() menu:switchItemTable(nil, buildItems()) end
-    buildItems = function()
-        local items = self:shelfToolbarItems(false, refresh)
-        local sorted = ShelfSort.sort_books(books, self.settings:get("shelf").sort_order)
-        for _i, book in ipairs(sorted) do
-            table.insert(items, {
-                text = book.title or book.bookId or _("Untitled"),
-                post_text = book.author or "",
-                callback = self.ui_host:safeCallback(book.title or book.bookId or _("Untitled"), function()
-                    self:showMPAccount(book)
-                end),
-            })
-        end
-        return items
-    end
-    menu = self.ui_host:showList(_("Public Accounts"), buildItems(), _("No items."))
-end
-
-function WeReadPlugin:showMPAccount(book)
-    self:rememberMPAccount(book)
-    if not self.account:requireLogin(true, false) then
-        return
-    end
-    local book_id = book.book_id or book.bookId
-    local cached = self:getCachedMPArticles(book_id)
-    if cached and #cached > 0 then
-        self:showMPArticleList(book, cached)
-        return
-    end
-    self:fetchMPArticles(book)
-end
-
-function WeReadPlugin:rememberMPAccount(book)
-    local book_id = book.book_id or book.bookId
-    if not book_id then
-        return
-    end
-    local books = self.settings:get("books", {})
-    local record = books[book_id] or {}
-    record.book_id = book_id
-    record.title = book.title or record.title
-    record.author = book.author or record.author
-    record.updated_at = os.time()
-    -- Keep the resolved cache directory in sync both ways so the transient book
-    -- object used for cached-path lookups knows where its articles actually live.
-    record.cache_dir = book.cache_dir or record.cache_dir
-    book.cache_dir = record.cache_dir
-    books[book_id] = record
-    self.settings:set("books", books)
-    self.settings:flush()
-end
-
-function WeReadPlugin:fetchMPArticles(book)
-    if not self.account:requireLogin(true, false) then
-        return
-    end
-    self.ui_host:runOnlineTask(_("Loading articles..."), function()
-        self.ui_host:showBusy(_("Loading articles..."))
-        local book_id = book.book_id or book.bookId
-        local function request_articles()
-            local ticket = self.settings:get("wr_ticket", "")
-            if ticket == "" then ticket = nil end
-            return self.client:get_mp_articles(book_id, 0, 100, ticket)
-        end
-        local ok, result, err_code = pcall(request_articles)
-        if ok and not result and (err_code == -2041 or err_code == -2012) then
-            logger.info(LOG_MODULE, "MP credentials rejected; renewing before retry")
-            local renew_ok = pcall(function()
-                return self.client:renew_cookie()
-            end)
-            if renew_ok then
-                ok, result, err_code = pcall(request_articles)
-            end
-        end
-        self.ui_host:closeBusy()
-        if not ok then
-            logger.err(LOG_MODULE, "load MP articles failed:", log_error(result))
-            self.ui_host:showInfo(T(_("Load articles failed:\n%1"), display_error(result)))
-            return
-        end
-        if not result and (err_code == -2041 or err_code == -2012) then
-            logger.warn(LOG_MODULE, "load MP articles rejected, error_code:", tostring(err_code))
-            self.ui_host:showInfo(_("WeRead could not refresh the public-account credential. Please scan the QR code again."))
-            return
-        end
-        if not result then
-            logger.warn(LOG_MODULE, "load MP articles failed, error_code:", tostring(err_code))
-            self.ui_host:showInfo(T(_("Load articles failed:\n%1"), "errCode " .. tostring(err_code)))
-            return
-        end
-        local articles = Content.parse_mp_articles(result)
-        self:cacheMPArticles(book_id, articles)
-        self:showMPArticleList(book, articles)
-    end)
-end
-
-function WeReadPlugin:getCachedMPArticles(book_id)
-    local books = self.settings:get("books", {})
-    local record = books[book_id]
-    if record and record.mp_articles then
-        return record.mp_articles
-    end
-    return nil
-end
-
-function WeReadPlugin:cacheMPArticles(book_id, articles)
-    local books = self.settings:get("books", {})
-    books[book_id] = books[book_id] or {}
-    books[book_id].mp_articles = articles
-    books[book_id].mp_articles_time = os.time()
-    self.settings:set("books", books)
-    self.settings:flush()
-end
-
-function WeReadPlugin:showMPArticleList(book, articles)
-    local items = {}
-    for _i, article in ipairs(articles) do
-        local cached_path = Content.mp_article_cached_path(self.settings, book, article)
-        local is_cached = cached_path ~= nil
-        local date_str = ""
-        if article.createTime and article.createTime > 0 then
-            date_str = os.date("%Y-%m-%d", article.createTime)
-        end
-        table.insert(items, {
-            text = article.title or _("Article"),
-            post_text = date_str,
-            mandatory = is_cached and _("Cached") or "",
-            callback = self.ui_host:safeCallback(article.title or _("Article"), function()
-                if is_cached then
-                    self.ui_host:openFile(cached_path)
-                else
-                    self:downloadMPArticleAndRead(book, article)
-                end
-            end),
-        })
-    end
-    table.insert(items, {
-        text = _("Refresh article list"),
-        callback = self.ui_host:safeCallback(_("Refresh article list"), function()
-            self:fetchMPArticles(book)
-        end),
-    })
-    self.ui_host:showList(book.title or _("Public Account"), items, _("No articles."))
-end
-
-function WeReadPlugin:downloadMPArticleAndRead(book, article)
-    if not self.account:requireLogin(true, false) then
-        return
-    end
-    self.ui_host:runOnlineTask(_("Download article and read"), function()
-        self.ui_host:showBusy(T(_("Downloading article: %1"), article.title or ""))
-        local progress_dialog
-        local ok, path_or_err = pcall(function()
-            return Content.fetch_mp_article_html(self.client, self.settings, book, article, {
-                progress = function(current, total)
-                    if not progress_dialog then
-                        self.ui_host:closeBusy()
-                        progress_dialog = ProgressbarDialog:new{
-                            title = T(_("Downloading images: %1"), article.title or ""),
-                            progress_max = total,
-                        }
-                        progress_dialog:show()
-                        self.ui_host:refreshUI()
-                    end
-                    progress_dialog:reportProgress(current)
-                end,
-            })
-        end)
-        if progress_dialog then
-            progress_dialog:close()
-        else
-            self.ui_host:closeBusy()
-        end
-        if not ok then
-            logger.err(LOG_MODULE, "download MP article failed:", log_error(path_or_err))
-            self.ui_host:showInfo(T(_("Download failed:\n%1"), display_error(path_or_err)))
-            return
-        end
-        logger.info(
-            LOG_MODULE,
-            "MP article downloaded:",
-            "images=", self.settings:get("cache").download_mp_images and "embedded" or "removed"
-        )
-        -- Persist the resolved cache directory (set by save_mp_article_html) so the
-        -- article files can still be located after the download directory changes.
-        local book_id = book.book_id or book.bookId
-        if book_id and book.cache_dir then
-            local books = self.settings:get("books", {})
-            local record = books[book_id] or {}
-            record.cache_dir = book.cache_dir
-            books[book_id] = record
-            self.settings:set("books", books)
-            self.settings:flush()
-        end
-        self.ui_host:openFile(path_or_err)
-    end)
-end
-
-function WeReadPlugin:loadChapters(book, callback, force_refresh)
-    if not force_refresh then
-        if book.chapters and #book.chapters > 0 then
-            callback(book.chapters)
-            return
-        end
-        local cached = Content.load_catalog_cache(self.client, self.settings, book)
-        if cached then
-            callback(cached)
-            return
-        end
-    end
-    if not self.account:requireLogin(true, false) then
-        return
-    end
-    self.ui_host:runOnlineTask(_("Loading chapter list..."), function()
-        self.ui_host:showBusy(_("Loading chapter list..."))
-        local ok, chapters_or_err = pcall(function()
-            Content.ensure_reader_state(self.client, book)
-            return Content.fetch_catalog(self.client, book)
-        end)
-        self.ui_host:closeBusy()
-        if not ok then
-            logger.err(LOG_MODULE, "load chapters failed:", log_error(chapters_or_err))
-            self.ui_host:showInfo(T(_("Load chapters failed:\n%1"), display_error(chapters_or_err)))
-            return
-        end
-        local cache_ok, cache_err = Content.save_catalog_cache(
-            self.client, self.settings, book, chapters_or_err)
-        if not cache_ok then
-            logger.warn(LOG_MODULE, "save chapter catalog cache failed:", log_error(cache_err))
-        end
-        local books = self.settings:get("books", {})
-        local book_id = book.book_id or book.bookId
-        if book_id then
-            books[book_id] = book
-            self.settings:set("books", books)
-            self.settings:flush()
-        end
-        callback(chapters_or_err)
-    end)
-end
-
-function WeReadPlugin:showChapterList(book)
-    local menu
-    local function buildItems(chapters)
-        local items = {{
-            text = "↻ " .. _("Refresh chapter list"),
-            separator = true,
-            callback = self.ui_host:safeCallback(_("Refresh chapter list"), function()
-                self:loadChapters(book, function(refreshed_chapters)
-                    if menu then
-                        menu:switchItemTable(nil, buildItems(refreshed_chapters))
-                    end
-                    self.ui_host:showTransientInfo(T(_("Chapter list refreshed: %1 chapters"),
-                        tostring(#refreshed_chapters)), 2)
-                end, true)
-            end),
-        }}
-        for _i, chapter in ipairs(chapters) do
-            local cached = book.cached_chapters and book.cached_chapters[tostring(chapter.chapterUid)]
-            table.insert(items, {
-                text = chapter.title or T(_("Chapter %1"), tostring(chapter.chapterUid)),
-                post_text = cached and _("Cached") or T(_("%1 words"), tostring(chapter.wordCount or 0)),
-                callback = self.ui_host:safeCallback(chapter.title or _("Chapter"), function()
-                    self:openChapter(book, chapter)
-                end),
-            })
-        end
-        return items
-    end
-    self:loadChapters(book, function(chapters)
-        menu = self.ui_host:showList(book.title or _("Chapter list"), buildItems(chapters), _("No chapters."))
-    end)
-end
-
-function WeReadPlugin:openCachedBook(book)
-    self.ui_host:openFile(book.cached_file)
-end
-
--- Open a chapter, preferring its cached file and falling back to a download.
-function WeReadPlugin:openChapter(book, chapter)
-    local cached = book.cached_chapters and book.cached_chapters[tostring(chapter.chapterUid)]
-    if cached then
-        self.ui_host:openFile(cached)
-    else
-        self:downloadChapterAndRead(book, chapter)
-    end
-end
-
-function WeReadPlugin:downloadChapterAndRead(book, chapter)
-    self:confirmAndDownloadChapters(book, { chapter }, "chapter", {
-        single_chapter = true,
-    })
-end
-
-function WeReadPlugin:confirmDownloadAllChapters(book)
-    self:loadChapters(book, function(chapters)
-        self:confirmAndDownloadChapters(book, chapters, "full", {
-            confirmation_text = T(_("Download all %1 chapters as one EPUB?"), tostring(#chapters)),
-        })
-    end)
-end
-
--- Show the annotation cost warning consistently for every download entry.
--- With annotations disabled, single/partial downloads start immediately;
--- callers with their own confirmation text (the full-book action) keep only
--- that normal confirmation and do not show the annotation warning.
-function WeReadPlugin:confirmAndDownloadChapters(book, chapters, suffix, options)
-    options = options or {}
-    local includes_annotations = self.settings:get("cache").download_underlines_and_thoughts == true
-    local text = options.confirmation_text
-    if includes_annotations then
-        local warning = _("This download includes underlines and thoughts and may take significantly longer.")
-        text = text and (text .. "\n\n" .. warning) or warning
-    end
-    if not text then
-        self.downloader:start(book, chapters, suffix, options)
-        return
-    end
-
-    local confirm
-    confirm = ConfirmBox:new{
-        text = text,
-        ok_text = _("Download"),
-        ok_callback = self.ui_host:safeCallback(_("Download"), function()
-            UIManager:close(confirm)
-            self.downloader:start(book, chapters, suffix, options)
-        end),
-        cancel_text = _("Close"),
-    }
-    UIManager:show(confirm)
-end
-
-function WeReadPlugin:showSearch()
-    if not self.account:requireLogin(true, true) then
-        return
-    end
-    local dialog
-    dialog = InputDialog:new{
-        title = _("Search WeRead"),
-        input = "",
-        input_type = "text",
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = self.ui_host:safeCallback(_("Cancel"), function()
-                        UIManager:close(dialog)
-                    end),
-                },
-                {
-                    text = _("Search"),
-                    is_enter_default = true,
-                    callback = self.ui_host:safeCallback(_("Search"), function()
-                        local keyword = dialog:getInputText()
-                        UIManager:close(dialog)
-                        self:searchWithUI(keyword)
-                    end),
-                },
-            },
-        },
-    }
-    self.ui_host:showInputDialog(dialog)
-end
-
-function WeReadPlugin:searchWithUI(keyword)
-    if not keyword or keyword == "" then
-        return
-    end
-    self.ui_host:runOnlineTask(_("Search"), function()
-        local ok, result = pcall(function()
-            return self.client:gateway("/store/search", {
-                keyword = keyword,
-                count = 10,
-            })
-        end)
-        if not ok then
-            logger.err(LOG_MODULE, "search failed:", log_error(result))
-            self.ui_host:showInfo(T(_("Search failed:\n%1"), display_error(result)))
-            return
-        end
-        local items = {}
-        for group_index, group in ipairs(result.results or {}) do
-            for book_index, entry in ipairs(group.books or {}) do
-                local book = entry.bookInfo or entry
-                table.insert(items, {
-                    text = book.title or book.bookId or _("Untitled"),
-                    post_text = book.author or "",
-                    mandatory = book.category or "",
-                    callback = self.ui_host:safeCallback(book.title or book.bookId or _("Untitled"), function()
-                        self:showBookRecord(book)
-                    end),
-                })
-            end
-        end
-        self.ui_host:showList(T(_("Search: %1"), keyword), items, _("No search results."))
-    end)
-end
-
-function WeReadPlugin:showCurrentBookDetails()
-    if not self.account:requireLogin(true, true) then
-        return
-    end
-    local book_id = self:detectWeReadBook()
-    local book = book_id and self.settings:get("books", {})[book_id] or nil
-    if not book then
-        self.ui_host:showInfo(_("The current document is not a WeRead cached book."))
-        return
-    end
-    book.book_id = book.book_id or book_id
-    self:showBookRecord(book)
 end
 
 function WeReadPlugin:onShowWeRead()
@@ -2055,46 +1191,6 @@ function WeReadPlugin:_onThoughtTap(ges)
     return true
 end
 
--- Intercepts ReaderStatus:onEndOfBook for WeRead books (installed as a hook in
--- onReaderReady). Non-WeRead books defer to the original handler. For WeRead
--- books, an end_document_action of "next_file" auto-advances to the next
--- chapter; every other action (pop-up, book_status, …) shows our own navigation
--- dialog instead of the native one, falling back to the native handler only
--- when the dialog cannot be built.
-function WeReadPlugin:handleEndOfBook(status_self)
-    local action = G_reader_settings and G_reader_settings:readSetting("end_document_action") or "pop-up"
-    local book_id = self:detectWeReadBook()
-    if not book_id then
-        return self._orig_onEndOfBook(status_self)
-    end
-
-    local books = self.settings:get("books", {})
-    local book = books[book_id]
-    self:ensureChaptersLoaded(book)
-    local file = self.ui.document and self.ui.document.file
-    local current_idx, current_ch, is_full_book = BookIndex.chapter_info_from_file(book, file)
-    local next_ch = (not is_full_book) and current_idx and book.chapters[current_idx + 1]
-
-    if action == "next_file" then
-        if next_ch then
-            self:openChapter(book, next_ch)
-        else
-            self.ui_host:showInfo(_("You have reached the last chapter."))
-        end
-        return true
-    end
-
-    -- For every other end-of-document action, prefer our WeRead navigation
-    -- dialog. This intentionally overrides the global end_document_action
-    -- (pop-up, book_status, …) for WeRead books; fall back to the native
-    -- handler only when the dialog cannot be built.
-    if self:showEndOfBookDialog(book_id) then
-        return true
-    end
-
-    return self._orig_onEndOfBook(status_self)
-end
-
 function WeReadPlugin:onReaderReady()
     self._reader_session_gen = (self._reader_session_gen or 0) + 1
     self:_teardownThoughtInterception()
@@ -2130,17 +1226,9 @@ function WeReadPlugin:onReaderReady()
             })
         end)
 
-        if not self._orig_onEndOfBook and self.ui.status and type(self.ui.status.onEndOfBook) == "function" then
-            self._orig_onEndOfBook = self.ui.status.onEndOfBook
-            self.ui.status.onEndOfBook = function(status_self)
-                return self:handleEndOfBook(status_self)
-            end
-        end
+        self.chapters:installEndOfBookHook()
     else
-        if self._orig_onEndOfBook and self.ui.status then
-            self.ui.status.onEndOfBook = self._orig_onEndOfBook
-            self._orig_onEndOfBook = nil
-        end
+        self.chapters:removeEndOfBookHook()
     end
 
     local _started, _title, reason = self.read_report:on_reader_ready()
@@ -2153,12 +1241,7 @@ end
 function WeReadPlugin:onCloseDocument()
     self._reader_session_gen = (self._reader_session_gen or 0) + 1
     self:_teardownThoughtInterception()
-
-    if self._orig_onEndOfBook and self.ui.status then
-        self.ui.status.onEndOfBook = self._orig_onEndOfBook
-        self._orig_onEndOfBook = nil
-    end
-
+    self.chapters:removeEndOfBookHook()
     self.read_report:on_close_document()
 end
 
@@ -2176,72 +1259,6 @@ end
 
 function WeReadPlugin:onResume()
     self.read_report:on_resume()
-end
-
--- Returns true if the custom dialog was successfully displayed, or false if
--- the dialog could not be built (e.g., missing chapter info for MP articles),
--- allowing the caller to fall back to the native end-of-book handler.
-function WeReadPlugin:showEndOfBookDialog(book_id)
-    local file_path = self.ui.document and self.ui.document.file
-    if not file_path then return false end
-
-    local books = self.settings:get("books", {})
-    local book = books[book_id]
-    if not book or not self:ensureChaptersLoaded(book) then return false end
-
-    local current_idx, current_ch, is_full_book = BookIndex.chapter_info_from_file(book, file_path)
-    -- The chapter-nav row is shown only for single downloaded chapters (a mapped
-    -- current chapter that is not part of a full-book EPUB); "next chapter"
-    -- additionally requires a successor.
-    local show_chapter_nav = current_idx ~= nil and not is_full_book
-    local next_chapter = show_chapter_nav and book.chapters[current_idx + 1] or nil
-
-    EndOfBookDialog.show({ show_chapter_nav = show_chapter_nav, has_next = next_chapter ~= nil }, {
-        on_bookshelf = function()
-            self:showBookshelf()
-        end,
-        on_search = function()
-            self:showSearch()
-        end,
-        on_chapter_list = function()
-            self:showChapterList(book)
-        end,
-        on_next = next_chapter and function()
-            self:openChapter(book, next_chapter)
-        end or nil,
-        on_book_details = function()
-            self:showCurrentBookDetails()
-        end,
-        on_read_stats = function()
-            self:showReadStats()
-        end,
-        on_close_book = function()
-            -- Mirror KOReader's ReaderStatus:openFileBrowser(): closing the
-            -- reader alone exits the app when there is no file-manager stack, so
-            -- reopen the file browser right after (positioned on the book file).
-            local ui = self.ui
-            if not ui then return end
-            local file = ui.document and ui.document.file
-            ui:onClose()
-            if file and ui.showFileManager then
-                ui:showFileManager(file)
-            end
-        end,
-    })
-    return true
-end
-
--- Ensure the book's chapter catalog is available in memory. Since chapter lists
--- are no longer persisted with the book record (they live in a separate on-disk
--- catalog cache), a book loaded from settings usually has book.chapters == nil;
--- this loads it from the cache. Synchronous, no network. Returns the chapter
--- list, or nil if the cache is missing (e.g. the book was never opened/cached).
-function WeReadPlugin:ensureChaptersLoaded(book)
-    if not book then return nil end
-    if not (type(book.chapters) == "table" and #book.chapters > 0) then
-        Content.load_catalog_cache(self.client, self.settings, book)
-    end
-    return book.chapters
 end
 
 function WeReadPlugin:onFlushSettings()
