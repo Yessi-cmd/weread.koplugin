@@ -20,13 +20,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y luajit
 
+      # Every file is checked and every failure is reported: piping find into a
+      # while loop would have hidden a broken file whenever a later one compiled.
       - name: Lua syntax check
         run: |
-          find . -name '*.lua' \
-            -not -path './.git/*' \
-            -print0 | while IFS= read -r -d '' file; do
-              luajit -b "$file" /tmp/luajit-check.out
-            done
+          rc=0
+          while IFS= read -r -d '' file; do
+            luajit -b "$file" /tmp/luajit-check.out \
+              || { echo "::error file=${file#./}::Lua syntax error"; rc=1; }
+          done < <(find . -name '*.lua' -not -path './.git/*' -print0)
+          exit "$rc"
 
       - name: Unit tests
         run: |

@@ -1,4 +1,4 @@
-local ok_json, json = pcall(require, "json")
+ local ok_json, json = pcall(require, "json")
 if not ok_json then
     ok_json, json = pcall(require, "rapidjson")
 end
