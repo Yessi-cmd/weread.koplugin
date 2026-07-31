@@ -53,6 +53,17 @@ local defaults = {
     advanced = {
         developer_logs = false,
     },
+    update = {
+        auto_check = false,
+        prefer_proxy = true,
+        last_check = 0,
+        available_version = "",
+        archive_url = "",
+        checksum_url = "",
+        archive_size = 0,
+        release_notes = "",
+        release_url = "",
+    },
     shelf = {
         sort_order = "time_desc",
     },

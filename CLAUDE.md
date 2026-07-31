@@ -40,6 +40,7 @@ weread/ui/read_report.lua     Reading-report settings, target picker, and statis
 weread/ui/annotations_controller.lua Annotation visibility and thought-link interaction
 weread/ui/reader_navigation.lua End-of-book navigation integration
 weread/ui/download_dialog.lua Custom download progress dialog with cancel button
+weread/ui/updater.lua        Update dialogs and background-task progress presentation
 weread/ui/progress_sync_dialog.lua Progress conflict and sync-result dialogs
 weread/ui/thought_popup.lua   Native underline/thought TextViewer with previous/next paging
 ```

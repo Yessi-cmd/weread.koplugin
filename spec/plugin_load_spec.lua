@@ -78,6 +78,19 @@ end
 package.preload["weread.lib.settings"] = function()
     return { new = function() return fake_settings end }
 end
+package.preload["weread.lib.updater"] = function()
+    return {
+        new = function(_self, options) return options end,
+    }
+end
+package.preload["weread.ui.updater"] = function()
+    return {
+        new = function(_self, options)
+            options.schedule_auto_check = function() end
+            return options
+        end,
+    }
+end
 package.preload["weread.lib.migrations"] = function()
     return {
         run = function(settings, client)

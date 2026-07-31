@@ -132,6 +132,7 @@ Feature PRs must describe:
 - Use `require("weread.lib.logger")` for project logging. Do not require KOReader's `logger` directly or manually add a `[WeRead]` prefix.
 - User-facing strings should use `_()` and be translated in `weread/lib/i18n.lua`.
 - If menu items are added, removed, renamed, or moved, update `weread/ui/menu.lua` (or the owning feature UI module), `weread/lib/i18n.lua`, and the README menu tree together.
+- When bumping the release version, keep `_meta.lua` and `main.lua` in sync and add the matching `## [X.Y.Z]` section to `CHANGELOG.md`.
 - For non-public WeRead Web APIs, include a standalone reproducible Python verification script in `scripts/` before implementing it in Lua.
 - Do not commit KOReader `settings/weread.lua`, generated EPUB/cache files, API keys, cookies, anti-abuse headers, or private book content.
 
@@ -143,6 +144,7 @@ Feature PRs must describe:
 - 项目日志统一使用 `require("weread.lib.logger")`，不要直接引用 KOReader 的 `logger`，也不要手动添加 `[WeRead]` 前缀。
 - 用户可见文本需要使用 `_()`，并在 `weread/lib/i18n.lua` 中添加中文翻译。
 - 如果新增、删除、重命名或移动菜单项，需要同时更新 `weread/ui/menu.lua`（或对应功能的 UI 模块）、`weread/lib/i18n.lua` 和 README 菜单结构。
+- 发布版本升级时，需要同步修改 `_meta.lua` 和 `main.lua`，并在 `CHANGELOG.md` 中添加匹配的 `## [X.Y.Z]` 段落。
 - 涉及非公开 WeRead Web API 时，必须先在 `scripts/` 中提交可独立运行、可复现的 Python 验证脚本，再实现 Lua 版本。
 - 不要提交 KOReader 的 `settings/weread.lua`、生成的 EPUB/cache、API key、cookie、反滥用请求头或私人书籍内容。
 

@@ -169,6 +169,16 @@ jobs:
             exit 1
           fi
 
+      - name: Build release notes preface
+        if: steps.version.outputs.automatic_release == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bash scripts/extract_release_notes.sh \
+            "$VERSION" \
+            dist/release-preface.md
+          cat dist/release-preface.md
+
       - name: Create GitHub Release
         if: steps.version.outputs.automatic_release == 'true'
         env:
@@ -178,9 +188,11 @@ jobs:
           ARCHIVE: ${{ steps.version.outputs.archive }}
           TARGET_SHA: ${{ steps.version.outputs.target_sha }}
         run: |
+          release_preface="$(cat dist/release-preface.md)"
           gh release create "$TAG" \
             "$ARCHIVE" \
             "$ARCHIVE.sha256" \
             --target "$TARGET_SHA" \
             --title "Version $VERSION" \
+            --notes "$release_preface" \
             --generate-notes

@@ -15,13 +15,15 @@ local ProgressSyncDialog = require("weread.ui.progress_sync_dialog")
 local QRLogin = require("weread.lib.qr_login")
 local ReadReport = require("weread.lib.read_report")
 local Settings = require("weread.lib.settings")
+local Updater = require("weread.lib.updater")
+local UpdaterUI = require("weread.ui.updater")
 
 local _ = PluginUtil.tr
 
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "0.1.1",
+    version = "0.6.0",
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -43,6 +45,20 @@ function WeReadPlugin:init()
     math.randomseed(os.time())
     self.settings = Settings:new()
     self.library_db = LibraryDB:new(self.settings)
+    local updater = Updater:new{
+        settings = self.settings,
+        current_version = self.version,
+    }
+    self.updater = UpdaterUI:new{
+        updater = updater,
+        settings = self.settings,
+        is_connected = function()
+            return self:isNetworkConnected()
+        end,
+        refresh_ui = function()
+            self:refreshUI()
+        end,
+    }
     self.client = Client:new(self.settings)
     self.downloader = Downloader:new{
         client = self.client,
@@ -158,6 +174,7 @@ function WeReadPlugin:init()
         self.read_report:maybe_start("plugin_start")
     end
     self._reader_session_gen = 0
+    self.updater:schedule_auto_check()
     logger.info("initialized:", "version=", self.version)
 end
 

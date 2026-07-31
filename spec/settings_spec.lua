@@ -87,6 +87,8 @@ local settings = Settings:new()
 
 expect(settings.data_dir == "/data/weread", "data directory was wrong")
 expect(settings.cache_dir == "/data/weread/cache", "default cache directory was wrong")
+expect(settings:get("update").prefer_proxy == true,
+    "update proxy should be preferred by default")
 expect(created_dirs[1] == "/data/weread"
     and created_dirs[2] == "/data/weread/cache",
     "settings directories were not initialized")
