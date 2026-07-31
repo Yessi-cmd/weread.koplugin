@@ -68,7 +68,7 @@ function Content.book_resolved_dir(settings, book_id, book)
             return path:match("^(.*)/[^/]+$")
         end
     end
-    local dir = book and dirname(book.cached_file)
+    local dir = book and dirname(book.cached_full_book or book.cached_file)
     if not dir and book and type(book.cached_chapters) == "table" then
         for _i, chapter_path in pairs(book.cached_chapters) do
             dir = dirname(chapter_path)

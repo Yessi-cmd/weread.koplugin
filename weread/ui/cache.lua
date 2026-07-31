@@ -125,6 +125,8 @@ function M:moveBooksToNewDir(movable, new_dir)
                 if book then
                     book.cache_dir = m.dst
                     book.cached_file = self:remapCachedPath(book.cached_file, m.dst)
+                    book.cached_full_book = self:remapCachedPath(
+                        book.cached_full_book, m.dst)
                     if type(book.cached_chapters) == "table" then
                         for uid, path in pairs(book.cached_chapters) do
                             book.cached_chapters[uid] = self:remapCachedPath(path, m.dst)
@@ -332,6 +334,17 @@ function M:showShelfFilterOptions(on_changed)
     UIManager:show(dialog)
 end
 
+function M:bookRecordHasDownload(record)
+    if type(record) ~= "table" then return false end
+    if file_exists(record.cached_full_book) or file_exists(record.cached_file) then
+        return true
+    end
+    for _uid, path in pairs(record.cached_chapters or {}) do
+        if file_exists(path) then return true end
+    end
+    return false
+end
+
 function M:isBookDownloaded(book, saved_books, downloaded_cache)
     local book_id = book.book_id or book.bookId
     if not book_id then
@@ -341,7 +354,7 @@ function M:isBookDownloaded(book, saved_books, downloaded_cache)
         return downloaded_cache[book_id]
     end
     local record = (saved_books or self.settings:get("books", {}))[book_id]
-    local is_downloaded = record ~= nil and file_exists(record.cached_file)
+    local is_downloaded = self:bookRecordHasDownload(record)
     if downloaded_cache then
         downloaded_cache[book_id] = is_downloaded
     end

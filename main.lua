@@ -39,6 +39,13 @@ function WeReadPlugin:init()
         run_online_task = function(label, fn)
             return self:runOnlineTask(label, fn)
         end,
+        run_background_task = function(fn)
+            UIManager:scheduleIn(0.1, fn)
+            return true
+        end,
+        is_connected = function()
+            return self:isNetworkConnected()
+        end,
     }
     Migrations.run(self.settings, self.client)
     self.qr_login = QRLogin:new(self, self.client, self.settings)

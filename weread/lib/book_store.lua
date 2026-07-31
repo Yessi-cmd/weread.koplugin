@@ -51,7 +51,8 @@ local function resolved_dir(settings, book_id, book)
     if type(book) == "table" and type(book.cache_dir) == "string" and book.cache_dir ~= "" then
         return book.cache_dir
     end
-    local dir = type(book) == "table" and dirname(book.cached_file) or nil
+    local dir = type(book) == "table"
+        and dirname(book.cached_full_book or book.cached_file) or nil
     if not dir and type(book) == "table" and type(book.cached_chapters) == "table" then
         for _uid, path in pairs(book.cached_chapters) do
             dir = dirname(path)

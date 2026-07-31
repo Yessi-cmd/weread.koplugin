@@ -1,6 +1,7 @@
 -- Bookshelf, book, chapter, public-account, and search UI flows.
 local BookReviews = require("weread.lib.book_reviews")
 local BookReviewsView = require("weread.ui.book_reviews_view")
+local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Content = require("weread.lib.content")
 local InfoMessage = require("ui/widget/infomessage")
@@ -19,6 +20,14 @@ local display_error = PluginUtil.display_error
 local file_exists = PluginUtil.file_exists
 
 local M = {}
+
+local function list_items_per_page()
+    local perpage = 14
+    if G_reader_settings and G_reader_settings.readSetting then
+        perpage = tonumber(G_reader_settings:readSetting("items_per_page")) or perpage
+    end
+    return math.max(4, perpage)
+end
 
 function M:showBookshelf()
     if not self:requireLogin(true, true) then
@@ -130,7 +139,7 @@ function M:showShelfPage()
                     mandatory = rightStatus(is_cached),
                     mandatory_func = function()
                         local current = self._shelf_saved_books and self._shelf_saved_books[book_id]
-                        return rightStatus(current and file_exists(current.cached_file))
+                        return rightStatus(self:bookRecordHasDownload(current))
                     end,
                     callback = self:safeCallback(book.title or book.bookId or _("Untitled"), function()
                         self:showBookRecord(book)
@@ -278,9 +287,10 @@ function M:showBookMenu(book)
 
         local saved_books = self.settings:get("books", {})
         local saved = saved_books[book_id]
-        local cached_path = saved and saved.cached_file or book.cached_file
+        local cached_path = self:getFullBookCachePath(saved or book)
         local is_cached = file_exists(cached_path)
-        book.cached_file = is_cached and cached_path or nil
+        local has_cache = self:bookRecordHasDownload(saved or book)
+        book.cached_full_book = is_cached and cached_path or nil
 
         table.insert(items, {
             text = _("Chapter list"),
@@ -289,12 +299,13 @@ function M:showBookMenu(book)
                 self:showChapterList(book)
             end),
         })
-        if is_cached then
+        if has_cache then
             table.insert(items, {
                 text = _("Clear book cache"),
                 callback = self:safeCallback(_("Clear book cache"), function()
                     self:confirmClearBookCache(book_id, book.title or book_id, function()
                         book.cached_file = nil
+                        book.cached_full_book = nil
                         book.cached_chapters = nil
                         book.cache_dir = nil
                         book.chapters = nil
@@ -684,34 +695,150 @@ end
 function M:showChapterList(book)
     local menu
     local function buildItems(chapters)
-        local items = {{
-            text = "↻ " .. _("Refresh chapter list"),
-            separator = true,
-            callback = self:safeCallback(_("Refresh chapter list"), function()
-                self:loadChapters(book, function(refreshed_chapters)
-                    if menu then
-                        menu:switchItemTable(nil, buildItems(refreshed_chapters))
-                    end
-                    self:showTransientInfo(T(_("Chapter list refreshed: %1 chapters"),
-                        tostring(#refreshed_chapters)), 2)
-                end, true)
-            end),
-        }}
-        for _i, chapter in ipairs(chapters) do
-            local cached = book.cached_chapters and book.cached_chapters[tostring(chapter.chapterUid)]
-            table.insert(items, {
-                text = chapter.title or T(_("Chapter %1"), tostring(chapter.chapterUid)),
-                post_text = cached and _("Cached") or T(_("%1 words"), tostring(chapter.wordCount or 0)),
-                callback = self:safeCallback(chapter.title or _("Chapter"), function()
-                    self:openChapter(book, chapter)
+        local items = {}
+        local perpage = list_items_per_page()
+        local chapters_per_page = math.max(1, perpage - 2)
+        local function appendActions()
+            items[#items + 1] = {
+                text = _("[Action] Refresh chapter list"),
+                bold = true,
+                callback = self:safeCallback(_("Refresh chapter list"), function()
+                    self:loadChapters(book, function(refreshed_chapters)
+                        if menu then
+                            local refreshed_items = buildItems(refreshed_chapters)
+                            menu:switchItemTable(nil, refreshed_items)
+                        end
+                        self:showTransientInfo(T(_("Chapter list refreshed: %1 chapters"),
+                            tostring(#refreshed_chapters)), 2)
+                    end, true)
                 end),
-            })
+            }
+            items[#items + 1] = {
+                text = _("[Action] Select chapters to download"),
+                bold = true,
+                separator = true,
+                callback = self:safeCallback(_("Select chapters to download"), function()
+                    self:showChapterDownloadSelection(book, chapters, function()
+                        if menu then
+                            local refreshed_items = buildItems(chapters)
+                            menu:switchItemTable(nil, refreshed_items, -1)
+                        end
+                    end)
+                end),
+            }
         end
-        return items
+
+        if #chapters == 0 then appendActions() end
+        for page_start = 1, #chapters, chapters_per_page do
+            appendActions()
+            local page_end = math.min(#chapters, page_start + chapters_per_page - 1)
+            for chapter_index = page_start, page_end do
+                local chapter = chapters[chapter_index]
+                local chapter_uid = chapter.chapterUid or chapter.chapterId
+                local cached = book.cached_chapters
+                    and book.cached_chapters[tostring(chapter_uid)]
+                if cached and not file_exists(cached) then
+                    book.cached_chapters[tostring(chapter_uid)] = nil
+                    cached = nil
+                end
+                items[#items + 1] = {
+                    text = chapter.title or T(_("Chapter %1"), tostring(chapter_uid)),
+                    mandatory = cached and _("Cached")
+                        or T(_("%1 words"), tostring(chapter.wordCount or 0)),
+                    callback = self:safeCallback(chapter.title or _("Chapter"), function()
+                        self:openChapter(book, chapter)
+                    end),
+                }
+            end
+        end
+        return items, perpage
     end
     self:loadChapters(book, function(chapters)
-        menu = self:showList(book.title or _("Chapter list"), buildItems(chapters), _("No chapters."))
+        local items, perpage = buildItems(chapters)
+        menu = self:showList(book.title or _("Chapter list"), items,
+            _("No chapters."), { items_per_page = perpage })
     end)
+end
+
+function M:showChapterDownloadSelection(book, chapters, on_downloaded)
+    local selected = {}
+    local menu
+    local function selectedChapters()
+        local result = {}
+        for _i, chapter in ipairs(chapters) do
+            local uid = tostring(chapter.chapterUid or chapter.chapterId or _i)
+            if selected[uid] then
+                result[#result + 1] = chapter
+            end
+        end
+        return result
+    end
+    local function selectedCount()
+        local count = 0
+        for _uid in pairs(selected) do count = count + 1 end
+        return count
+    end
+
+    local items = {}
+    local perpage = list_items_per_page()
+    local chapters_per_page = math.max(1, perpage - 1)
+    local function appendDownloadAction()
+        items[#items + 1] = {
+            text_func = function()
+                return T(_("[Download] Selected chapters (%1)"),
+                    tostring(selectedCount()))
+            end,
+            bold = true,
+            select_enabled_func = function() return selectedCount() > 0 end,
+            separator = true,
+            callback = self:safeCallback(_("Download selected chapters"), function()
+                local targets = selectedChapters()
+                if #targets == 0 then return end
+                self:confirmAndDownloadChapters(book, targets, "chapters", {
+                    separate_chapters = true,
+                    offer_read = false,
+                    on_complete = function(ok)
+                        if not ok then return end
+                        UIManager:scheduleIn(0.1, function()
+                            if menu then UIManager:close(menu) end
+                            if on_downloaded then on_downloaded() end
+                        end)
+                    end,
+                })
+            end),
+        }
+    end
+    for page_start = 1, #chapters, chapters_per_page do
+        appendDownloadAction()
+        local page_end = math.min(#chapters, page_start + chapters_per_page - 1)
+        for chapter_index = page_start, page_end do
+            local chapter = chapters[chapter_index]
+            local uid = tostring(chapter.chapterUid or chapter.chapterId or chapter_index)
+            local cached = book.cached_chapters and book.cached_chapters[uid]
+            local is_cached = file_exists(cached)
+            items[#items + 1] = {
+                text_func = function()
+                    local marker = selected[uid] and "[✓] " or "[  ] "
+                    return marker .. (chapter.title or T(_("Chapter %1"), uid))
+                end,
+                mandatory_func = function()
+                    if selected[uid] then return _("Selected") end
+                    return is_cached and _("Cached")
+                        or T(_("%1 words"), tostring(chapter.wordCount or 0))
+                end,
+                callback = self:safeCallback(chapter.title or _("Chapter"), function()
+                    if selected[uid] then
+                        selected[uid] = nil
+                    else
+                        selected[uid] = true
+                    end
+                    if menu then menu:updateItems() end
+                end),
+            }
+        end
+    end
+    menu = self:showList(_("Select chapters to download"), items,
+        _("No chapters."), { items_per_page = perpage })
 end
 
 function M:openFile(path)
@@ -727,14 +854,19 @@ function M:openFile(path)
 end
 
 function M:openCachedBook(book)
-    self:openFile(book.cached_file)
+    self:openFile(self:getFullBookCachePath(book))
 end
 
 -- Open a chapter, preferring its cached file and falling back to a download.
 function M:openChapter(book, chapter)
-    local cached = book.cached_chapters and book.cached_chapters[tostring(chapter.chapterUid)]
-    if cached then
+    local chapter_uid = chapter.chapterUid or chapter.chapterId
+    local cached = book.cached_chapters and book.cached_chapters[tostring(chapter_uid)]
+    if cached and file_exists(cached) then
         self:openFile(cached)
+    elseif self.downloader:promotePrefetch(book, chapter) then
+        -- The downloader promotes the background task to a visible progress
+        -- dialog and opens the chapter as soon as the same task completes.
+        return
     else
         self:downloadChapterAndRead(book, chapter)
     end
@@ -803,34 +935,52 @@ function M:confirmDownloadAllChapters(book)
     end)
 end
 
--- Show the annotation cost warning consistently for every download entry.
--- With annotations disabled, single/partial downloads start immediately;
--- callers with their own confirmation text (the full-book action) keep only
--- that normal confirmation and do not show the annotation warning.
+-- Every manual book/chapter download makes annotation fetching an explicit,
+-- per-job choice. The persisted annotation flag is reserved for background
+-- prefetches, so a manual choice never changes future automatic behaviour.
 function M:confirmAndDownloadChapters(book, chapters, suffix, options)
     options = options or {}
-    local includes_annotations = self.settings:get("cache").download_underlines_and_thoughts == true
     local text = options.confirmation_text
-    if includes_annotations then
-        local warning = _("This download includes underlines and thoughts and may take significantly longer.")
-        text = text and (text .. "\n\n" .. warning) or warning
+        or T(_("Download %1 selected chapter(s)?"), tostring(#chapters))
+    if suffix == "full" then
+        text = text .. "\n" .. _(
+            "A book with many chapters may take a long time. Prefer single- or multi-chapter downloads when possible."
+        )
     end
-    if not text then
-        self.downloader:start(book, chapters, suffix, options)
-        return
-    end
+    text = text .. "\n" .. _(
+        "Downloading underlines and thoughts adds requests for every chapter and may significantly increase download time."
+    )
 
-    local confirm
-    confirm = ConfirmBox:new{
-        text = text,
-        ok_text = _("Download"),
-        ok_callback = self:safeCallback(_("Download"), function()
-            UIManager:close(confirm)
-            self.downloader:start(book, chapters, suffix, options)
-        end),
-        cancel_text = _("Close"),
+    local dialog
+    local function start(include_annotations)
+        UIManager:close(dialog)
+        local job_options = {}
+        for key, value in pairs(options) do job_options[key] = value end
+        job_options.include_annotations = include_annotations == true
+        self.downloader:start(book, chapters, suffix, job_options)
+    end
+    dialog = ButtonDialog:new{
+        title = text,
+        buttons = {
+            {{
+                text = _("Download text only"),
+                callback = self:safeCallback(_("Download text only"), function()
+                    start(false)
+                end),
+            }},
+            {{
+                text = _("Download with underlines and thoughts"),
+                callback = self:safeCallback(_("Download with underlines and thoughts"), function()
+                    start(true)
+                end),
+            }},
+            {{
+                text = _("Cancel"),
+                callback = function() UIManager:close(dialog) end,
+            }},
+        },
     }
-    UIManager:show(confirm)
+    UIManager:show(dialog)
 end
 
 function M:pullProgressWithUI(book_id)
