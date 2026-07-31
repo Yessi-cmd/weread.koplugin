@@ -30,10 +30,10 @@ function M:showEndOfBookDialog(book_id)
     local is_regular_weread_book = book ~= nil and not WeRead.is_mp_book(book_id)
     local chapters = is_regular_weread_book and self:ensureChaptersLoaded(book) or nil
 
-    local current_idx, current_chapter, is_full_book
+    local current_idx, is_full_book
     if chapters then
-        current_idx, current_chapter, is_full_book =
-            self:getChapterInfoFromFile(book, file_path)
+        local chapter_info = { self:getChapterInfoFromFile(book, file_path) }
+        current_idx, is_full_book = chapter_info[1], chapter_info[3]
     end
     -- The chapter-nav row is shown only for single downloaded chapters (a mapped
     -- current chapter that is not part of a full-book EPUB); "next chapter"

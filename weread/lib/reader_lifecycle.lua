@@ -157,8 +157,8 @@ function M:maybePrefetchNextChapter(book_id)
         self.downloader:cancelPrefetch("prefetch_context_missing")
         return false
     end
-    local current_index, _current_chapter, is_full_book =
-        self:getChapterInfoFromFile(book, file)
+    local chapter_info = { self:getChapterInfoFromFile(book, file) }
+    local current_index, is_full_book = chapter_info[1], chapter_info[3]
     local next_chapter = not is_full_book and current_index
         and chapters[current_index + 1] or nil
     if not next_chapter then
