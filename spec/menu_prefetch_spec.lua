@@ -94,6 +94,15 @@ expect(quick_action and quick_action.reader == true
     "quick menu action remains reader-only")
 expect(quick_action and quick_action.title == "WeRead · Quick menu",
     "quick menu action has the requested title")
+local toggle_action = registered.weread_toggle_annotations
+expect(toggle_action and toggle_action.event == "ToggleWeReadAnnotations",
+    "annotation visibility action dispatches the matching reader event")
+expect(toggle_action and toggle_action.reader == true
+        and toggle_action.general ~= true,
+    "annotation visibility action is reader-only")
+expect(toggle_action
+        and toggle_action.title == "WeRead · Toggle underlines and thoughts",
+    "annotation visibility action has a gesture-friendly title")
 local bookshelf_action = registered.weread_bookshelf
 expect(bookshelf_action and bookshelf_action.event == "ShowWeReadBookshelf",
     "bookshelf dispatcher action uses the matching event")

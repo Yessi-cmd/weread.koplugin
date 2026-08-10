@@ -88,6 +88,11 @@ koreader/plugins/weread.koplugin/
 ├── 立即同步进度       （阅读微信读书缓存书籍时显示）
 ├── 书籍详情           （阅读微信读书缓存书籍时显示）
 ├── 显示划线和想法     （阅读书籍时显示，开关）
+├── XPointer 标注层原型 （阅读可重排文档时显示；不修改 EPUB/KOReader 笔记）
+│   ├── 显示原型下划线
+│   ├── 在当前页添加下划线
+│   ├── 清除原型下划线
+│   └── 标注层性能指标
 ├── 书架               书籍 / 公众号 Tab；书架内搜索、离线缓存、手动更新
 ├── 本地书架            已下载书籍（不包含单章）的本地入口
 ├── 搜索               搜索微信读书
@@ -132,6 +137,9 @@ koreader/plugins/weread.koplugin/
 ## 贡献
 
 欢迎提交 issue 和 PR。提交前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+XPointer 外部标注层仍是实验性功能，测试步骤和限制见
+[原型说明](docs/xpointer-overlay-prototype.md)。
 
 ## 许可证
 

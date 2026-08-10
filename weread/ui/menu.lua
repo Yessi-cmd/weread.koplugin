@@ -6,7 +6,6 @@ local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local logger = require("weread.lib.logger")
 local UIManager = require("ui/uimanager")
-local ThoughtPopup = require("weread.ui.thought_popup")
 local WeRead = require("weread.lib.protocol")
 
 local PluginUtil = require("weread.lib.plugin_util")
@@ -45,6 +44,12 @@ function M:onDispatcherRegisterActions()
         event = "ShowWeReadSearch",
         title = _("WeRead · Search"),
         general = true,
+    })
+    Dispatcher:registerAction("weread_toggle_annotations", {
+        category = "none",
+        event = "ToggleWeReadAnnotations",
+        title = _("WeRead · Toggle underlines and thoughts"),
+        reader = true,
     })
 end
 
@@ -150,22 +155,17 @@ function M:getMainMenuItems()
             end,
             keep_menu_open = true,
             callback = self:safeCallback(_("Show underlines and thoughts"), function()
-                local cache = self.settings:get("cache")
-                cache.show_annotations = not (cache.show_annotations ~= false)
-                self.settings:set("cache", cache)
-                self.settings:flush()
-                logger.info(
-                    "annotation visibility changed:",
-                    "show=", tostring(cache.show_annotations)
-                )
-                -- Keep the tap interception registered in both states; hiding is
-                -- handled by _onThoughtTap. Just close any popup already showing.
-                if not cache.show_annotations then
-                    ThoughtPopup.closeVisible()
-                    self._thought_popup_open = nil
-                end
-                self:applyAnnotationVisibility()
+                self:toggleAnnotationVisibility()
             end),
+        })
+        table.insert(items, 5, {
+            text = _("Local-book underlines and thoughts"),
+            enabled_func = function()
+                return self:_xpointerOverlayPrototypeAvailable()
+            end,
+            sub_item_table_func = function()
+                return self:getXPointerOverlayPrototypeMenuItems()
+            end,
         })
     end
 
