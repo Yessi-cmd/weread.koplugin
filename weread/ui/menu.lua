@@ -93,8 +93,8 @@ function M:getMainMenuItems()
             end),
         },
         {
-            text = _("Local bookshelf"),
-            callback = self:safeCallback(_("Local bookshelf"), function()
+            text = _("WeRead favorites"),
+            callback = self:safeCallback(_("WeRead favorites"), function()
                 self:showWereadCollection()
             end),
         },
@@ -130,25 +130,27 @@ function M:getMainMenuItems()
     }
 
     if self.ui.document then
-        table.insert(items, 2, {
-            text = _("Sync progress now"),
-            keep_menu_open = true,
-            enabled_func = function()
-                local book_id = self:detectWeReadBook()
-                return book_id ~= nil and not WeRead.is_mp_book(book_id)
-            end,
-            callback = self:safeCallback(_("Sync progress now"), function()
-                self:onWeReadSyncProgress()
-            end),
-        })
-        table.insert(items, 3, {
-            text = _("Book details"),
-            keep_menu_open = true,
-            callback = self:safeCallback(_("Book details"), function()
-                self:showCurrentBookDetails()
-            end),
-        })
-        table.insert(items, 4, {
+        local book_id = self:detectWeReadBook()
+        local reader_items = {}
+        if book_id ~= nil then
+            if not WeRead.is_mp_book(book_id) then
+                reader_items[#reader_items + 1] = {
+                    text = _("Sync progress now"),
+                    keep_menu_open = true,
+                    callback = self:safeCallback(_("Sync progress now"), function()
+                        self:onWeReadSyncProgress()
+                    end),
+                }
+            end
+            reader_items[#reader_items + 1] = {
+                text = _("Book details"),
+                keep_menu_open = true,
+                callback = self:safeCallback(_("Book details"), function()
+                    self:showCurrentBookDetails()
+                end),
+            }
+        end
+        reader_items[#reader_items + 1] = {
             text = _("Show underlines and thoughts"),
             checked_func = function()
                 return self.settings:get("cache").show_annotations ~= false
@@ -157,16 +159,21 @@ function M:getMainMenuItems()
             callback = self:safeCallback(_("Show underlines and thoughts"), function()
                 self:toggleAnnotationVisibility()
             end),
-        })
-        table.insert(items, 5, {
-            text = _("Local-book underlines and thoughts"),
-            enabled_func = function()
-                return self:_xpointerOverlayPrototypeAvailable()
-            end,
-            sub_item_table_func = function()
-                return self:getXPointerOverlayPrototypeMenuItems()
-            end,
-        })
+        }
+        if book_id == nil then
+            reader_items[#reader_items + 1] = {
+                text = _("Local-book underlines and thoughts"),
+                enabled_func = function()
+                    return self:_xpointerOverlayPrototypeAvailable()
+                end,
+                sub_item_table_func = function()
+                    return self:getXPointerOverlayPrototypeMenuItems()
+                end,
+            }
+        end
+        for index = #reader_items, 1, -1 do
+            table.insert(items, 2, reader_items[index])
+        end
     end
 
     return items

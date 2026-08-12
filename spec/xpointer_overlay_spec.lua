@@ -99,7 +99,12 @@ end
 package.preload["weread.lib.plugin_util"] = function()
     return {
         tr = function(text) return text end,
-        T = function(text) return text end,
+        T = function(text, ...)
+            local values = { ... }
+            return (text:gsub("%%(%d+)", function(index)
+                return tostring(values[tonumber(index)] or "")
+            end))
+        end,
     }
 end
 local Controller = require("weread.ui.xpointer_overlay_controller")
@@ -129,12 +134,17 @@ local bind_host = {
             return true
         end,
         clearSyncCheckpoint = function() return true end,
+        clearDocument = function()
+            saved_document = nil
+            return true
+        end,
     },
     client = { gateway = function() return {} end },
     requireLogin = function() return true end,
     showInputDialog = function() end,
     runOnlineTask = function(_self, _label, callback) callback() end,
     showList = function(_self, _title, items) listed_items = items end,
+    showTransientInfo = function() end,
 }
 for name, method in pairs(Controller) do bind_host[name] = method end
 local sync_calls = 0
@@ -146,10 +156,29 @@ expect(saved_document and saved_document.binding.book_id == "book-1",
     "selecting a search result did not persist its binding")
 expect(confirm_options and confirm_options.title == "Local book matched",
     "selecting a search result did not ask whether to sync immediately")
+expect(confirm_options and confirm_options.text:find("resumed automatically", 1, true),
+    "match confirmation did not explain resumable sync")
 expect(sync_calls == 0,
     "annotation sync started before the user confirmed")
 confirm_options.ok_callback()
 expect(sync_calls == 1,
     "confirming the match did not start annotation sync")
+local local_book_items = bind_host:getXPointerOverlayPrototypeMenuItems()
+expect(#local_book_items == 3,
+    "local-book menu retained duplicate visibility or diagnostic items")
+expect(local_book_items[2].text_func() == "Sync underlines and thoughts"
+        and local_book_items[3].text
+            == "Clear data",
+    "local-book menu actions did not use unified terminology")
+saved_document.stats = { located = 242, total = 379 }
+expect(bind_host:getXPointerOverlayPrototypeMenuItems()[2].text_func()
+        == "Sync underlines and thoughts · 242 matched",
+    "local-book sync menu did not show the last matched count")
+local menu_updates = 0
+local_book_items[3].callback({
+    updateItems = function() menu_updates = menu_updates + 1 end,
+})
+expect(saved_document == nil and menu_updates == 1,
+    "clearing local-book data did not refresh the open menu immediately")
 
 print(("xpointer_overlay_spec: %d checks"):format(checks))

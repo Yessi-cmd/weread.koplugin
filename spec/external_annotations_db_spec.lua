@@ -35,13 +35,15 @@ package.preload["lua-ljsqlite3/init"] = function()
             if fail_open and path:find(fail_open, 1, true) then error("open failed") end
             files[path] = true
             databases[path] = databases[path] or {
-                documents = {}, sync_chapters = {},
+                documents = {}, sync_chapters = {}, sync_review_batches = {},
             }
             local data = databases[path]
             local db = {}
             db.exec = function(_db, sql)
                 if sql:find("DELETE FROM sync_chapters", 1, true) then
                     data.sync_chapters = {}
+                elseif sql:find("DELETE FROM sync_review_batches", 1, true) then
+                    data.sync_review_batches = {}
                 elseif sql:find("DELETE FROM sync_state", 1, true) then
                     data.sync_state = nil
                 end
@@ -60,6 +62,23 @@ package.preload["lua-ljsqlite3/init"] = function()
                 stmt.step = function(current)
                     if current.sql:find("SELECT payload FROM sync_state", 1, true) then
                         return data.sync_state and { data.sync_state } or nil
+                    end
+                    if current.sql:find(
+                            "SELECT chapter_uid, batch_index, payload", 1, true) then
+                        current.batch_rows = current.batch_rows or (function()
+                            local rows = {}
+                            for uid, batches in pairs(data.sync_review_batches) do
+                                for index, payload in pairs(batches) do
+                                    rows[#rows + 1] = { uid, index, payload }
+                                end
+                            end
+                            table.sort(rows, function(a, b)
+                                return a[1] == b[1] and a[2] < b[2] or a[1] < b[1]
+                            end)
+                            return rows
+                        end)()
+                        current.row_index = (current.row_index or 0) + 1
+                        return current.batch_rows[current.row_index]
                     end
                     if current.sql:find("SELECT position, chapter_uid, payload", 1, true) then
                         current.row_index = (current.row_index or 0) + 1
@@ -81,6 +100,15 @@ package.preload["lua-ljsqlite3/init"] = function()
                             chapter_uid = current.args[2],
                             payload = current.args[3],
                         }
+                    elseif current.sql:find(
+                            "INSERT INTO sync_review_batches", 1, true) then
+                        local uid, index = current.args[1], current.args[2]
+                        data.sync_review_batches[uid] =
+                            data.sync_review_batches[uid] or {}
+                        data.sync_review_batches[uid][index] = current.args[3]
+                    elseif current.sql:find(
+                            "DELETE FROM sync_review_batches WHERE", 1, true) then
+                        data.sync_review_batches[current.args[1]] = nil
                     end
                     return nil
                 end
@@ -148,12 +176,28 @@ expect(store:replaceSyncCheckpoint("/books/第一炉香.epub", {
     book_id = "7", catalog_signature = "signature", chapters = {},
 }), "sync checkpoint could not be initialized")
 expect(store:saveSyncChapter("/books/第一炉香.epub", 1, "chapter-1", {
-    underlines = { { range = "1-2" } }, reviews = {},
-}), "completed sync chapter could not be checkpointed")
+    underlines = { { range = "1-2" } }, reviews = {}, complete = false,
+}), "partial sync chapter could not be checkpointed")
+expect(store:saveSyncReviewBatch(
+    "/books/第一炉香.epub", "chapter-1", 1,
+    { { range = "1-2", pageReviews = { { review = { content = "想法" } } } } }),
+    "sync review batch could not be checkpointed")
 local checkpoint = store:getSyncCheckpoint("/books/第一炉香.epub")
 expect(checkpoint and checkpoint.catalog_signature == "signature"
-        and checkpoint.chapters[1].chapter_uid == "chapter-1",
-    "sync checkpoint could not be resumed")
+        and checkpoint.chapters[1].chapter_uid == "chapter-1"
+        and checkpoint.chapters[1].review_batches[1].batch_index == 1
+        and checkpoint.chapters[1].review_batches[1].reviews[1]
+            .pageReviews[1].review.content == "想法",
+    "batch-level sync checkpoint could not be resumed")
+expect(store:finishSyncChapter("/books/第一炉香.epub", 1, "chapter-1", {
+    underlines = { { range = "1-2" } },
+    reviews = checkpoint.chapters[1].review_batches[1].reviews,
+    complete = true,
+}), "completed sync chapter could not be committed")
+checkpoint = store:getSyncCheckpoint("/books/第一炉香.epub")
+expect(checkpoint.chapters[1].complete == true
+        and #checkpoint.chapters[1].review_batches == 0,
+    "completed chapter retained temporary review batches")
 expect(store:clearSyncCheckpoint("/books/第一炉香.epub")
         and store:getSyncCheckpoint("/books/第一炉香.epub") == nil,
     "completed sync checkpoint was not cleared")

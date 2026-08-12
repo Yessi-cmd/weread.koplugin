@@ -118,6 +118,14 @@ function ExternalAnnotationsDB:open(document_path, create)
                 payload     TEXT NOT NULL
             )
         ]])
+        db:exec([[
+            CREATE TABLE IF NOT EXISTS sync_review_batches (
+                chapter_uid TEXT NOT NULL,
+                batch_index INTEGER NOT NULL,
+                payload     TEXT NOT NULL,
+                PRIMARY KEY (chapter_uid, batch_index)
+            ) WITHOUT ROWID
+        ]])
     end)
     if not schema_ok then
         pcall(function() db:close() end)
@@ -204,7 +212,7 @@ function ExternalAnnotationsDB:getSyncCheckpoint(path)
         if open_err then logger.warn("annotation checkpoint read skipped:", open_err) end
         return nil
     end
-    local state_stmt, chapter_stmt
+    local state_stmt, chapter_stmt, batch_stmt
     local state
     local ok, err = pcall(function()
         state_stmt = db:prepare("SELECT payload FROM sync_state WHERE id=1")
@@ -212,6 +220,7 @@ function ExternalAnnotationsDB:getSyncCheckpoint(path)
         state = row and decode(row[1]) or nil
         if type(state) ~= "table" then return end
         state.chapters = {}
+        local chapters_by_uid = {}
         chapter_stmt = db:prepare([[
             SELECT position, chapter_uid, payload
             FROM sync_chapters ORDER BY position
@@ -222,13 +231,32 @@ function ExternalAnnotationsDB:getSyncCheckpoint(path)
             if type(chapter) == "table" then
                 chapter.position = tonumber(row[1]) or chapter.position
                 chapter.chapter_uid = tostring(row[2])
+                chapter.review_batches = {}
                 state.chapters[#state.chapters + 1] = chapter
+                chapters_by_uid[chapter.chapter_uid] = chapter
             end
             row = chapter_stmt:step()
+        end
+        batch_stmt = db:prepare([[
+            SELECT chapter_uid, batch_index, payload
+            FROM sync_review_batches ORDER BY chapter_uid, batch_index
+        ]])
+        row = batch_stmt:reset():step()
+        while row do
+            local chapter = chapters_by_uid[tostring(row[1])]
+            local batch = decode(row[3])
+            if chapter and type(batch) == "table" then
+                chapter.review_batches[#chapter.review_batches + 1] = {
+                    batch_index = tonumber(row[2]),
+                    reviews = type(batch.reviews) == "table" and batch.reviews or {},
+                }
+            end
+            row = batch_stmt:step()
         end
     end)
     close_statement(state_stmt)
     close_statement(chapter_stmt)
+    close_statement(batch_stmt)
     pcall(function() db:close() end)
     if not ok then
         logger.warn("annotation checkpoint read failed:", err)
@@ -255,6 +283,7 @@ function ExternalAnnotationsDB:replaceSyncCheckpoint(path, state)
     local ok, err = pcall(function()
         db:exec("BEGIN")
         transaction_open = true
+        db:exec("DELETE FROM sync_review_batches")
         db:exec("DELETE FROM sync_chapters")
         db:exec("DELETE FROM sync_state")
         stmt = db:prepare("INSERT INTO sync_state (id, payload) VALUES (1, ?)")
@@ -297,6 +326,74 @@ function ExternalAnnotationsDB:saveSyncChapter(path, position, chapter_uid, valu
     return ok, ok and nil or tostring(err)
 end
 
+function ExternalAnnotationsDB:saveSyncReviewBatch(path, chapter_uid, batch_index, reviews)
+    path = tostring(path or "")
+    chapter_uid = tostring(chapter_uid or "")
+    batch_index = tonumber(batch_index)
+    if path == "" or chapter_uid == "" or not batch_index
+        or type(reviews) ~= "table" then
+        return false, "valid checkpoint review batch fields are required"
+    end
+    local payload, encode_err = encode({ reviews = reviews })
+    if not payload then return false, tostring(encode_err) end
+    local db, open_err = self:open(path, true)
+    if not db then return false, open_err end
+    local stmt
+    local ok, err = pcall(function()
+        stmt = db:prepare([[
+            INSERT INTO sync_review_batches (chapter_uid, batch_index, payload)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chapter_uid, batch_index) DO UPDATE SET
+                payload=excluded.payload
+        ]])
+        stmt:reset():bind(chapter_uid, batch_index, payload):step()
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    return ok, ok and nil or tostring(err)
+end
+
+function ExternalAnnotationsDB:finishSyncChapter(path, position, chapter_uid, value)
+    path = tostring(path or "")
+    chapter_uid = tostring(chapter_uid or "")
+    position = tonumber(position)
+    if path == "" or not position or chapter_uid == "" or type(value) ~= "table" then
+        return false, "valid completed checkpoint chapter fields are required"
+    end
+    local payload, encode_err = encode(value)
+    if not payload then return false, tostring(encode_err) end
+    local db, open_err = self:open(path, true)
+    if not db then return false, open_err end
+    local transaction_open = false
+    local chapter_stmt, batch_stmt
+    local ok, err = pcall(function()
+        db:exec("BEGIN")
+        transaction_open = true
+        chapter_stmt = db:prepare([[
+            INSERT INTO sync_chapters (position, chapter_uid, payload)
+            VALUES (?, ?, ?)
+            ON CONFLICT(position) DO UPDATE SET
+                chapter_uid=excluded.chapter_uid,
+                payload=excluded.payload
+        ]])
+        chapter_stmt:reset():bind(position, chapter_uid, payload):step()
+        close_statement(chapter_stmt)
+        chapter_stmt = nil
+        batch_stmt = db:prepare(
+            "DELETE FROM sync_review_batches WHERE chapter_uid=?")
+        batch_stmt:reset():bind(chapter_uid):step()
+        close_statement(batch_stmt)
+        batch_stmt = nil
+        db:exec("COMMIT")
+        transaction_open = false
+    end)
+    close_statement(chapter_stmt)
+    close_statement(batch_stmt)
+    if not ok and transaction_open then pcall(function() db:exec("ROLLBACK") end) end
+    pcall(function() db:close() end)
+    return ok, ok and nil or tostring(err)
+end
+
 function ExternalAnnotationsDB:clearSyncCheckpoint(path)
     path = tostring(path or "")
     if path == "" then return false, "document path is required" end
@@ -306,6 +403,7 @@ function ExternalAnnotationsDB:clearSyncCheckpoint(path)
     local ok, err = pcall(function()
         db:exec("BEGIN")
         transaction_open = true
+        db:exec("DELETE FROM sync_review_batches")
         db:exec("DELETE FROM sync_chapters")
         db:exec("DELETE FROM sync_state")
         db:exec("COMMIT")

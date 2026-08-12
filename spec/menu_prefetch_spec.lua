@@ -36,7 +36,7 @@ package.preload["weread.ui.thought_popup"] = function()
     return { closeVisible = function() end }
 end
 package.preload["weread.lib.protocol"] = function()
-    return { is_mp_book = function() return false end }
+    return { is_mp_book = function(book_id) return book_id == "mp-book" end }
 end
 package.preload["weread.lib.plugin_util"] = function()
     return {
@@ -171,6 +171,38 @@ for _, item in ipairs(main_items) do
             item.text .. " keeps the main menu open while its dialog is shown")
     end
 end
+
+local function menu_has(items, text)
+    for _, item in ipairs(items or {}) do
+        if item.text == text then return true end
+    end
+    return false
+end
+
+expect(menu_has(main_items, "WeRead favorites"),
+    "main menu did not rename the local collection entry")
+
+host.ui.document = { file = "/books/local.epub" }
+host.detectWeReadBook = function() return nil end
+local local_reader_items = host:getMainMenuItems()
+expect(not menu_has(local_reader_items, "Sync progress now")
+        and not menu_has(local_reader_items, "Book details")
+        and menu_has(local_reader_items, "Local-book underlines and thoughts"),
+    "local document menu retained WeRead-only book actions")
+
+host.detectWeReadBook = function() return "book-1" end
+local weread_reader_items = host:getMainMenuItems()
+expect(menu_has(weread_reader_items, "Sync progress now")
+        and menu_has(weread_reader_items, "Book details")
+        and not menu_has(weread_reader_items, "Local-book underlines and thoughts"),
+    "WeRead book menu retained the local-book annotation submenu")
+
+host.detectWeReadBook = function() return "mp-book" end
+local mp_reader_items = host:getMainMenuItems()
+expect(not menu_has(mp_reader_items, "Sync progress now")
+        and menu_has(mp_reader_items, "Book details")
+        and not menu_has(mp_reader_items, "Local-book underlines and thoughts"),
+    "public-account menu exposed unsupported progress or local-book actions")
 local download_settings
 local cache_management
 for _, item in ipairs(settings_items) do

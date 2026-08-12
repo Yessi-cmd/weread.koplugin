@@ -1,7 +1,8 @@
 # XPointer external annotation overlay prototype
 
-This prototype validates a plugin-owned annotation layer for reflowable
-CREngine documents. It intentionally does not fetch WeRead data yet.
+This implementation uses a plugin-owned annotation layer for reflowable
+CREngine documents and synchronizes WeRead underlines and thoughts without
+modifying the source book or KOReader notes.
 
 ## What it proves
 
@@ -15,39 +16,40 @@ CREngine documents. It intentionally does not fetch WeRead data yet.
 - Page-mode projections are cached and invalidated by ReaderView layout resets
   or `DocumentRerendered`.
 
-Prototype records are stored under `overlay_prototype` in the WeRead plugin
-settings. They are not added to `ui.annotation.annotations` and are not written
-to the book's `.sdr` annotation list.
+Each local book has an isolated SQLite database under
+`<KOReader data>/weread/external-annotations/`. Records are not added to
+`ui.annotation.annotations` and are not written to the book's `.sdr`
+annotation list.
+
+Synchronization checkpoints are stored in that same per-book database. Review
+requests run one small batch per UI step; each completed batch is committed
+independently, so cancellation normally waits only for the active network
+request and resumes at the next batch. KOReader's standby guard is held for the
+whole operation and released on success, cancellation, or failure.
 
 ## Manual test
 
 1. Open a local EPUB or another reflowable CREngine document.
-2. Open `Tools → WeRead → XPointer overlay prototype`.
-3. Select `Add underline on current page`.
-4. Close the menu. A short range near the top of the current view should have
-   a gray underline.
+2. Open `Tools → WeRead → Local-book underlines and thoughts`.
+3. Match the local book to its WeRead title and synchronize.
+4. Close the menu. Synchronized ranges should have an underline.
 5. Tap the underline outside the configured left/right page-turn edge. The
    normal WeRead thought popup should open.
 6. Change font size, line spacing, margins and orientation. The underline
    should follow the same text after the document is rerendered.
-7. Return to the prototype menu and inspect `Overlay metrics`. A repeated paint
-   of the same page should use the page cache; changing layout should force a
-   new projection.
-8. Select `Clear prototype underlines` and verify the book and KOReader note
-   list are unchanged.
+7. Toggle `Show underlines and thoughts` in the main WeRead menu and verify it
+   controls both downloaded WeRead books and local-book overlays.
+8. Select `Clear data` and verify the source
+   book and KOReader note list are unchanged.
 
 ## Prototype limits
 
 - Only reflowable CREngine documents are supported. Fixed-layout PDF/DjVu
   coordinates are deliberately out of scope.
-- The prototype generates a short range from the current view. It does not yet
-  search quotations, bind a local book to WeRead, or populate the SQLite
-  thought database.
-- Records are keyed by the current file path. A production implementation
-  needs a document fingerprint and XPointer/text validation after file changes.
-- The renderer currently scans the small prototype record list. A production
-  implementation needs a sorted position/chapter index before loading large
-  annotation sets.
+- Records are keyed by the current file path. Moving or replacing a book
+  requires matching it again.
+- Quote matching can miss ranges when the local edition differs from the
+  WeRead edition.
 
 ## Performance gate for further work
 

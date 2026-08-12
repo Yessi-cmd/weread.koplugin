@@ -125,7 +125,7 @@ local cancelled = {
             "cancel completion result was wrong")
     end,
 }
-downloader._standby_ref = 1
+downloader:_beginStandby()
 downloader:_step(cancelled)
 downloader:_step(cancelled)
 expect(cancellation_count == 1, "cancel completion callback was not idempotent")
@@ -143,7 +143,7 @@ local guarded = {
             "guarded error completion result was wrong")
     end,
 }
-downloader._standby_ref = 1
+downloader:_beginStandby()
 downloader:_scheduleGuarded(guarded, function()
     error("guarded boom")
 end, 0)
@@ -154,6 +154,6 @@ expect(guarded_completion_count == 1 and closed == 1,
 expect(downloader._standby_ref == 0 and allowed == 2,
     "guarded failure leaked the standby guard")
 expect(#messages >= 2, "lifecycle failures were not surfaced to the user")
-expect(prevented == 0, "test unexpectedly acquired a standby guard")
+expect(prevented == 2, "standby guard was not acquired exactly once per job")
 
 print(("downloader_lifecycle_spec: %d checks"):format(checks))

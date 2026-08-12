@@ -5,6 +5,7 @@ local Content = require("weread.lib.content")
 local Crypto = require("weread.lib.crypto")
 local External = require("weread.lib.external_annotations")
 local logger = require("weread.lib.logger")
+local StandbyGuard = require("weread.lib.standby_guard")
 local Overlay = require("weread.ui.xpointer_overlay")
 local PluginUtil = require("weread.lib.plugin_util")
 
@@ -12,6 +13,9 @@ local _ = PluginUtil.tr
 local T = PluginUtil.T
 
 local M = {}
+-- Version 6 stores incomplete chapters and their review batches separately,
+-- allowing cancellation and resume between individual network requests.
+local SYNC_FORMAT_VERSION = 6
 local VIEW_MODULE = "weread_xpointer_overlay"
 local TOUCH_ZONE = "weread_xpointer_overlay_tap"
 
@@ -131,10 +135,6 @@ function M:_onXPointerOverlayTap(ges)
     return true
 end
 
-function M:toggleXPointerOverlayPrototype()
-    self:toggleAnnotationVisibility()
-end
-
 local function current_entry(plugin)
     return plugin.external_annotations_db:getDocument(current_file(plugin))
 end
@@ -185,7 +185,7 @@ function M:bindExternalAnnotationsBook(touchmenu_instance)
                                 local ConfirmBox = require("ui/widget/confirmbox")
                                 UIManager:show(ConfirmBox:new{
                                     title = _("Local book matched"),
-                                    text = T(_("Matched with “%1”.\n\nSync underlines and thoughts now?"),
+                                    text = T(_("Matched with “%1”.\n\nSync underlines and thoughts now?\n\nYou can cancel at any time. Downloaded progress is saved and resumed automatically next time."),
                                         book.title ~= "" and book.title or book.book_id),
                                     ok_text = _("Sync underlines and thoughts"),
                                     cancel_text = _("Later"),
@@ -226,21 +226,19 @@ function M:syncExternalAnnotations()
         binding = binding,
         cancelled = false,
     }
+    local cancel_request
     local progress
     progress = DownloadDialog:new{
         title = _("Preparing local-book annotation sync…"),
+        description = _(
+            "You can cancel at any time. Downloaded progress is saved and resumed automatically next time."),
         progress_max = 1,
         buttons = { {
             {
                 text = _("Cancel"),
                 callback = function()
                     if self._external_annotation_sync ~= request then return end
-                    request.cancelled = true
-                    self._external_annotation_sync = nil
-                    progress:close()
-                    request.progress = nil
-                    self:showTransientInfo(_(
-                        "Sync cancelled. Downloaded chapters were saved and will resume next time."), 3)
+                    cancel_request()
                 end,
             },
         } },
@@ -248,6 +246,7 @@ function M:syncExternalAnnotations()
     request.progress = progress
     self._external_annotation_sync = request
     progress:show()
+    request.standby_guard = StandbyGuard.acquire()
     local label = _("Sync local-book underlines and thoughts")
     logger.info("external annotation sync started:",
         "book_id=", tostring(binding.book_id), "path=", tostring(path))
@@ -266,6 +265,18 @@ function M:syncExternalAnnotations()
             request.progress:close()
             request.progress = nil
         end
+        if request.standby_guard then
+            StandbyGuard.release(request.standby_guard)
+            request.standby_guard = nil
+        end
+    end
+
+    cancel_request = function()
+        if request.cancelled then return end
+        request.cancelled = true
+        finish_request()
+        self:showTransientInfo(_(
+            "Sync cancelled. Downloaded progress was saved and will resume next time."), 3)
     end
 
     local function fail_request(err)
@@ -276,7 +287,7 @@ function M:syncExternalAnnotations()
         finish_request()
         logger.warn("external annotation sync interrupted:", tostring(err))
         self:showInfo(T(_(
-            "Underlines and thoughts sync was interrupted:\n%1\n\nDownloaded chapters were saved. Retry to continue."),
+            "Underlines and thoughts sync was interrupted:\n%1\n\nDownloaded progress was saved. Retry to continue."),
             tostring(err or "unknown")))
     end
 
@@ -292,7 +303,8 @@ function M:syncExternalAnnotations()
     end
 
     local download_next_chapter
-    local download_current_reviews
+    local download_current_review_batch
+    local finish_current_chapter
     local finish_sync
 
     finish_sync = function()
@@ -306,6 +318,11 @@ function M:syncExternalAnnotations()
             end
         end
         local records, stats = External.locate(self.ui.document, chapters)
+        if stats.total > 0 and stats.located == 0 then
+            error(T(_(
+                "Downloaded %1 underlines, but none could be matched. Existing data was not changed; retry to continue."),
+                tostring(stats.total)))
+        end
         request.entry.records = records
         request.entry.stats = stats
         request.entry.synced_at = os.time()
@@ -324,38 +341,88 @@ function M:syncExternalAnnotations()
             tostring(stats.located), tostring(stats.total)))
     end
 
-    download_current_reviews = function()
-        local reviews = {}
-        if #request.ranges > 0 then
-            local ok, result, err = self.client:get_chapter_reviews(
-                binding.book_id, request.current_uid, request.ranges)
-            if not ok or type(result) ~= "table" then
-                error(err or "could not download thoughts")
-            end
-            reviews = type(result.reviews) == "table" and result.reviews or {}
-        end
+    finish_current_chapter = function()
         local value = {
             book_id = binding.book_id,
             chapter_uid = request.current_uid,
             underlines = request.current_underlines.underlines or {},
-            reviews = reviews,
+            reviews = request.current_reviews,
+            complete = true,
         }
-        local saved, save_err = self.external_annotations_db:saveSyncChapter(
+        local saved, save_err = self.external_annotations_db:finishSyncChapter(
             request.path, request.current_index, request.current_uid, value)
         if not saved then error(save_err) end
         request.completed[request.current_uid] = value
+        request.partials[request.current_uid] = nil
         request.completed_count = request.completed_count + 1
         request.progress:reportProgress(request.completed_count)
         schedule_step(download_next_chapter)
     end
 
+    download_current_review_batch = function()
+        local batch_index = request.review_batch_index
+        if batch_index > #request.review_batches then
+            finish_current_chapter()
+            return
+        end
+        local ok, result, err = self.client:get_chapter_reviews_batch(
+            binding.book_id, request.current_api_uid,
+            request.review_batches[batch_index])
+        if not ok or type(result) ~= "table"
+            or type(result.reviews) ~= "table" then
+            error(err or "could not download thoughts")
+        end
+        local saved, save_err = self.external_annotations_db:saveSyncReviewBatch(
+            request.path, request.current_uid, batch_index, result.reviews)
+        if not saved then error(save_err) end
+        for _, review in ipairs(result.reviews) do
+            request.current_reviews[#request.current_reviews + 1] = review
+        end
+        request.review_batch_index = batch_index + 1
+        request.progress:reportProgress(request.completed_count
+            + batch_index / #request.review_batches)
+        schedule_step(download_current_review_batch)
+    end
+
+    local function resume_current_chapter(partial)
+        request.current_underlines = {
+            underlines = type(partial.underlines) == "table"
+                and partial.underlines or {},
+        }
+        request.ranges = require("weread.lib.thoughts").collect_ranges(
+            request.current_underlines)
+        request.review_batches = self.client:build_chapter_review_batches(
+            request.ranges)
+        request.current_reviews = {}
+        request.review_batch_index = 1
+        for _, saved_batch in ipairs(partial.review_batches or {}) do
+            local saved_index = tonumber(saved_batch.batch_index)
+            if saved_index ~= request.review_batch_index
+                or saved_index > #request.review_batches then
+                break
+            end
+            for _, review in ipairs(saved_batch.reviews or {}) do
+                request.current_reviews[#request.current_reviews + 1] = review
+            end
+            request.review_batch_index = saved_index + 1
+        end
+        if #request.review_batches > 0 then
+            request.progress:reportProgress(request.completed_count
+                + (request.review_batch_index - 1) / #request.review_batches)
+            schedule_step(download_current_review_batch)
+        else
+            schedule_step(finish_current_chapter)
+        end
+    end
+
     download_next_chapter = function()
-        local selected_index, selected_chapter, selected_uid
+        local selected_index, selected_chapter, selected_uid, selected_api_uid
         for chapter_index, chapter in ipairs(request.catalog) do
-            local uid = tostring(chapter.chapterUid or chapter.chapterId)
+            local api_uid = chapter.chapterUid or chapter.chapterId
+            local uid = tostring(api_uid)
             if not request.completed[uid] then
-                selected_index, selected_chapter, selected_uid =
-                    chapter_index, chapter, uid
+                selected_index, selected_chapter, selected_uid, selected_api_uid =
+                    chapter_index, chapter, uid, api_uid
                 break
             end
         end
@@ -366,17 +433,42 @@ function M:syncExternalAnnotations()
         request.current_index = selected_index
         request.current_chapter = selected_chapter
         request.current_uid = selected_uid
+        request.current_api_uid = selected_api_uid
         request.progress:setTitle(T(_(
             "Downloading underlines and thoughts · chapter %1/%2"),
             tostring(selected_index), tostring(#request.catalog)))
+        local partial = request.partials[selected_uid]
+        if partial then
+            resume_current_chapter(partial)
+            return
+        end
         local ok, underlines, err = self.client:get_chapter_underlines(
-            binding.book_id, selected_uid)
+            binding.book_id, selected_api_uid)
         if not ok or type(underlines) ~= "table" then
             error(err or "could not download underlines")
         end
         request.current_underlines = underlines
         request.ranges = require("weread.lib.thoughts").collect_ranges(underlines)
-        schedule_step(download_current_reviews)
+        request.review_batches = self.client:build_chapter_review_batches(
+            request.ranges)
+        request.review_batch_index = 1
+        request.current_reviews = {}
+        local partial_value = {
+            book_id = binding.book_id,
+            chapter_uid = selected_uid,
+            underlines = underlines.underlines or {},
+            reviews = {},
+            complete = false,
+        }
+        local saved, save_err = self.external_annotations_db:saveSyncChapter(
+            request.path, selected_index, selected_uid, partial_value)
+        if not saved then error(save_err) end
+        request.partials[selected_uid] = partial_value
+        if #request.review_batches > 0 then
+            schedule_step(download_current_review_batch)
+        else
+            schedule_step(finish_current_chapter)
+        end
     end
 
     local function prepare_sync()
@@ -399,9 +491,11 @@ function M:syncExternalAnnotations()
         local checkpoint = self.external_annotations_db:getSyncCheckpoint(path)
         if not checkpoint
             or tostring(checkpoint.book_id or "") ~= tostring(binding.book_id)
-            or checkpoint.catalog_signature ~= signature then
+            or checkpoint.catalog_signature ~= signature
+            or tonumber(checkpoint.format_version) ~= SYNC_FORMAT_VERSION then
             checkpoint = {
                 book_id = tostring(binding.book_id),
+                format_version = SYNC_FORMAT_VERSION,
                 catalog_signature = signature,
                 total = #request.catalog,
                 started_at = os.time(),
@@ -412,6 +506,7 @@ function M:syncExternalAnnotations()
             if not saved then error(save_err) end
         end
         request.completed = {}
+        request.partials = {}
         request.completed_count = 0
         local catalog_uids = {}
         for _, chapter in ipairs(request.catalog) do
@@ -420,8 +515,12 @@ function M:syncExternalAnnotations()
         for _, chapter in ipairs(checkpoint.chapters or {}) do
             local uid = tostring(chapter.chapter_uid or "")
             if uid ~= "" and catalog_uids[uid] then
-                request.completed[uid] = chapter
-                request.completed_count = request.completed_count + 1
+                if chapter.complete == true then
+                    request.completed[uid] = chapter
+                    request.completed_count = request.completed_count + 1
+                else
+                    request.partials[uid] = chapter
+                end
             end
         end
         request.progress.progress_max = #request.catalog
@@ -440,7 +539,7 @@ function M:syncExternalAnnotations()
     if not started then finish_request() end
 end
 
-function M:clearExternalAnnotations()
+function M:clearExternalAnnotations(touchmenu_instance)
     local cleared, clear_err = self.external_annotations_db:clearDocument(current_file(self))
     if not cleared then
         self:showInfo(T(_("Could not clear local-book annotation data: %1"),
@@ -449,19 +548,14 @@ function M:clearExternalAnnotations()
     end
     if self._xpointer_overlay then self._xpointer_overlay:setRecords({}) end
     UIManager:setDirty(self.dialog, "ui")
+    if touchmenu_instance and type(touchmenu_instance.updateItems) == "function" then
+        touchmenu_instance:updateItems()
+    end
     self:showTransientInfo(_("Local-book annotation data cleared."), 2)
 end
 
 function M:getXPointerOverlayPrototypeMenuItems()
     return {
-        {
-            text = _("Show local-book underlines"),
-            checked_func = function()
-                return self.settings:get("cache", {}).show_annotations ~= false
-            end,
-            keep_menu_open = true,
-            callback = function() self:toggleXPointerOverlayPrototype() end,
-        },
         {
             text_func = function()
                 local entry = current_entry(self)
@@ -473,7 +567,16 @@ function M:getXPointerOverlayPrototypeMenuItems()
             end,
         },
         {
-            text = _("Sync underlines and thoughts"),
+            text_func = function()
+                local entry = current_entry(self)
+                local located = entry and entry.stats
+                    and tonumber(entry.stats.located)
+                if located then
+                    return T(_("Sync underlines and thoughts · %1 matched"),
+                        tostring(located))
+                end
+                return _("Sync underlines and thoughts")
+            end,
             enabled_func = function()
                 local entry = current_entry(self)
                 return entry and entry.binding ~= nil
@@ -481,23 +584,12 @@ function M:getXPointerOverlayPrototypeMenuItems()
             callback = function() self:syncExternalAnnotations() end,
         },
         {
-            text = _("Clear match and annotation data"),
+            text = _("Clear data"),
             enabled_func = function() return current_entry(self) ~= nil end,
             keep_menu_open = true,
-            callback = function() self:clearExternalAnnotations() end,
-        },
-        {
-            text_func = function()
-                local metrics = self._xpointer_overlay
-                    and self._xpointer_overlay.last_metrics or {}
-                return T(
-                    _("Overlay metrics: %1 candidate(s), %2 box(es), %3 ms"),
-                    tostring(metrics.candidates or 0),
-                    tostring(metrics.boxes or 0),
-                    string.format("%.2f", tonumber(metrics.elapsed_ms) or 0)
-                )
+            callback = function(touchmenu_instance)
+                self:clearExternalAnnotations(touchmenu_instance)
             end,
-            enabled_func = function() return false end,
         },
     }
 end
