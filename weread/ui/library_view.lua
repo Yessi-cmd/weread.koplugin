@@ -103,6 +103,7 @@ local CoverCell = InputContainer:extend{
     width = nil,
     height = nil,
     cover_path = nil,
+    cover_loading = false,
     status = "",
     callback = nil,
     show_parent = nil,
@@ -121,16 +122,30 @@ function CoverCell:init()
     local image_height = math.max(1, cover_height - 2 * padding - 2 * border)
     local cover_content
     if self.cover_path then
-        cover_content = ImageWidget:new{
-            file = self.cover_path,
-            width = image_width,
-            height = image_height,
-            scale_factor = 0,
-        }
-        self._has_cover = true
-    else
+        local image
+        local ok = pcall(function()
+            image = ImageWidget:new{
+                file = self.cover_path,
+                width = image_width,
+                height = image_height,
+                scale_factor = 0,
+                -- Shelf thumbnails are short-lived page content. Keeping them
+                -- out of KOReader's 8 MiB global image cache also makes corrupt
+                -- or unexpectedly large legacy files unable to crash the UI.
+                file_do_cache = false,
+            }
+            image:getSize()
+        end)
+        if ok and image then
+            cover_content = image
+            self._has_cover = true
+        elseif image and type(image.free) == "function" then
+            pcall(image.free, image)
+        end
+    end
+    if not cover_content then
         cover_content = TextWidget:new{
-            text = _("No cover"),
+            text = self.cover_loading and _("Cover loading") or _("No cover"),
             face = Font:getFace("cfont", 18),
             max_width = image_width,
         }
@@ -225,6 +240,7 @@ local LibraryView = FocusManager:extend{
     cover_rows = 2,
     cover_cell_height = nil,
     cover_paths = nil,
+    cover_loading = nil,
     on_page_changed = nil,
 }
 
@@ -393,6 +409,7 @@ function LibraryView:content()
                 book = book,
                 status = self:itemStatus(book),
                 cover_path = self.cover_paths and self.cover_paths[book] or nil,
+                cover_loading = self.cover_loading and self.cover_loading[book] == true,
                 width = width,
                 height = cell_height,
                 show_parent = self,
@@ -434,8 +451,10 @@ end
 function LibraryView:pageBar()
     if not self.paged or (self.page_count or 1) <= 1 then return nil end
     local cell_w = math.floor(self.screen_w / 3)
+    local button_height = Screen:scaleBySize(54)
     local previous = Button:new{
-        text = _("Previous"), width = cell_w, radius = 0, margin = 0,
+        text = _("Previous"), width = cell_w, height = button_height,
+        text_font_size = 22, text_font_bold = true, radius = 0, margin = 0,
         bordersize = 0, enabled = self.page > 1, show_parent = self,
         callback = function()
             if self.page > 1 and self.on_page_changed then
@@ -444,12 +463,14 @@ function LibraryView:pageBar()
         end,
     }
     local page_text = Button:new{
-        text = T(_("Page %1 of %2"), tostring(self.page), tostring(self.page_count)),
-        width = cell_w, radius = 0, margin = 0, bordersize = 0,
+        text = T(_("%1/%2 pages"), tostring(self.page), tostring(self.page_count)),
+        width = cell_w, height = button_height, text_font_size = 18,
+        radius = 0, margin = 0, bordersize = 0,
         enabled = false, show_parent = self,
     }
     local next_page = Button:new{
         text = _("Next"), width = self.screen_w - 2 * cell_w,
+        height = button_height, text_font_size = 22, text_font_bold = true,
         radius = 0, margin = 0, bordersize = 0,
         enabled = self.page < self.page_count, show_parent = self,
         callback = function()
@@ -574,6 +595,7 @@ function M.show(data, callbacks)
         cover_rows = data.cover_rows,
         cover_cell_height = data.cover_cell_height,
         cover_paths = data.cover_paths,
+        cover_loading = data.cover_loading,
         on_switch = callbacks.on_switch,
         on_search = callbacks.on_search,
         on_refresh = callbacks.on_refresh,

@@ -174,6 +174,11 @@ expect(#paged_view._item_rows == 10,
     "paged bookshelf created rows outside the current page")
 expect(#paged_view._page_buttons == 3,
     "paged bookshelf did not create navigation controls")
+expect(paged_view._page_buttons[2].text == "2/3 pages",
+    "bookshelf page indicator did not use compact current/total text")
+expect((paged_view._page_buttons[1].height or 0) >= 54
+        and (paged_view._page_buttons[3].height or 0) >= 54,
+    "bookshelf page buttons lost their enlarged tap targets")
 changed_page = nil
 paged_view._page_buttons[1].callback()
 expect(changed_page == 1, "previous-page button returned the wrong page")

@@ -12,6 +12,20 @@ package.preload["ui/uimanager"] = function()
         scheduleIn = function(_self, _delay, callback) callback() end,
     }
 end
+local subprocess_runs, subprocess_payload = 0, nil
+package.preload["ffi/util"] = function()
+    return {
+        runInSubProcess = function(callback)
+            subprocess_runs = subprocess_runs + 1
+            callback(100 + subprocess_runs, 200 + subprocess_runs)
+            return 100 + subprocess_runs, 200 + subprocess_runs
+        end,
+        writeToFD = function(_fd, data) subprocess_payload = data return true end,
+        isSubProcessDone = function() return true end,
+        terminateSubProcess = function() end,
+        readAllFromFD = function() local data = subprocess_payload subprocess_payload = nil return data end,
+    }
+end
 package.preload["device"] = function()
     return {
         screen = {
@@ -179,15 +193,21 @@ host.client = {
 }
 cover_path_lookups = 0
 host:showShelfView("books", nil, shown[8], {})
+expect(shown[9].data.cover_loading[shelf[1]] == true,
+    "uncached online cover did not show its loading state")
 expect(#cover_requests == 6,
     "cover view fetched books outside the current six-item page: "
         .. tostring(#cover_requests) .. " lookups=" .. tostring(cover_path_lookups)
         .. " page=" .. tostring(shown[9] and shown[9].data.page))
+expect(subprocess_runs == 6,
+    "cover network and thumbnail work did not run in background subprocesses")
 expect(cover_requests[1].options.skip_cookie == true
         and cover_requests[1].options.persist_response_cookies == false,
     "public cover request did not suppress account credentials")
 expect(#shown == 10 and shown[10].data.cover_paths[shelf[1]] ~= nil,
     "cover batch did not refresh the page once with cached paths")
+expect(shown[10].data.cover_loading[shelf[1]] ~= true,
+    "cached cover incorrectly remained in its loading state")
 
 local requests_before_unsafe_url = #cover_requests
 local unsafe_view = { page = 1 }

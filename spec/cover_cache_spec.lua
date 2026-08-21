@@ -67,6 +67,13 @@ local cache = CoverCache:new({ data_dir = "/data/weread" }, {
     open_file = open_file,
     rename_file = rename_file,
     remove_file = remove_file,
+    render_thumbnail = function(source, target, width, height)
+        expect(width == 300 and height == 450,
+            "cover cache used the wrong thumbnail bounds")
+        expect(files[source] ~= nil, "thumbnail source was not written first")
+        files[target] = "\137PNG\r\n\26\n" .. string.rep("t", 20)
+        return target
+    end,
 })
 local book = { bookId = "one", cover = "https://cdn.example/one" }
 
@@ -77,8 +84,8 @@ expect(cache:pathFor(book) == nil, "missing cover unexpectedly resolved to a fil
 
 local jpeg = "\255\216\255" .. string.rep("j", 20)
 local jpeg_path = assert(cache:store(book, jpeg))
-expect(jpeg_path:match("%.jpg$") and cache:pathFor(book) == jpeg_path,
-    "JPEG cover was not committed and resolved")
+expect(jpeg_path:match("%.thumb%.png$") and cache:pathFor(book) == jpeg_path,
+    "JPEG cover was not converted to a bounded thumbnail")
 expect(directories[cache.dir], "cover cache directory was not created")
 files[jpeg_path] = ""
 expect(cache:pathFor(book) == nil,
@@ -88,15 +95,24 @@ files[jpeg_path] = jpeg
 local png_book = { cover = "https://cdn.example/two" }
 local png = "\137PNG\r\n\26\n" .. string.rep("p", 20)
 local png_path = assert(cache:store(png_book, png))
-expect(png_path:match("%.png$"), "PNG cover used the wrong extension")
+expect(png_path:match("%.thumb%.png$"), "PNG cover did not use the thumbnail suffix")
+local legacy_book = { cover = "https://cdn.example/legacy" }
+local legacy_path = cache.dir .. "/" .. cache:key(legacy_book) .. ".jpg"
+files[legacy_path] = jpeg
+expect(cache:sourcePathFor(legacy_book) == legacy_path,
+    "legacy full-resolution cover was not found as a migration source")
+local migrated_path = assert(cache:thumbnailFromCached(legacy_book))
+expect(migrated_path:match("%.thumb%.png$") and files[legacy_path] == nil,
+    "legacy cover was not replaced by a bounded thumbnail")
+files[migrated_path] = nil
 expect(cache:store({ cover = "https://cdn.example/bad" }, "not an image") == nil,
     "unsupported cover data was cached")
 expect(cache:store({ cover = "https://cdn.example/tiny" }, "\255\216\255") == nil,
     "truncated image header was cached")
 
 modified[jpeg_path], modified[png_path] = 1, 2
-local removed = cache:prune(#png)
-expect(removed == 1 and files[jpeg_path] == nil and files[png_path] == png,
+local removed = cache:prune(#files[png_path])
+expect(removed == 1 and files[jpeg_path] == nil and files[png_path] ~= nil,
     "cover cache did not evict the oldest file at its size limit")
 
 print(("cover_cache_spec: %d checks"):format(checks))

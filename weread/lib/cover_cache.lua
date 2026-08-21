@@ -9,6 +9,8 @@ CoverCache.__index = CoverCache
 CoverCache.MAX_BYTES = 32 * 1024 * 1024
 CoverCache.MAX_IMAGE_BYTES = 3 * 1024 * 1024
 CoverCache.MIN_IMAGE_BYTES = 16
+CoverCache.THUMBNAIL_WIDTH = 300
+CoverCache.THUMBNAIL_HEIGHT = 450
 
 local extensions = { "jpg", "png", "webp", "gif" }
 
@@ -34,6 +36,9 @@ function CoverCache:new(settings, dependencies)
         open_file = dependencies.open_file or io.open,
         rename_file = dependencies.rename_file or os.rename,
         remove_file = dependencies.remove_file or os.remove,
+        render_thumbnail = dependencies.render_thumbnail or function(...)
+            return require("weread.lib.cover_thumbnail").render(...)
+        end,
     }, self)
 end
 
@@ -46,11 +51,72 @@ end
 function CoverCache:pathFor(book)
     local key = self:key(book)
     if not key then return nil end
+    local path = self.dir .. "/" .. key .. ".thumb.png"
+    if valid_cached_file(path) then return path end
+    return nil
+end
+
+-- Covers cached by the first cover-shelf release were stored at their source
+-- resolution. Keep them as migration inputs, but never expose them to the UI.
+function CoverCache:sourcePathFor(book)
+    local key = self:key(book)
+    if not key then return nil end
     for _, extension in ipairs(extensions) do
         local path = self.dir .. "/" .. key .. "." .. extension
         if valid_cached_file(path) then return path end
     end
     return nil
+end
+
+function CoverCache:_ensureDir()
+    if lfs.attributes(self.dir, "mode") then return true end
+    local created, mkdir_err = lfs.mkdir(self.dir)
+    if created or lfs.attributes(self.dir, "mode") then return true end
+    return nil, tostring(mkdir_err or "cover cache directory creation failed")
+end
+
+function CoverCache:_thumbnailFromSource(book, source)
+    local key = self:key(book)
+    if not key then return nil, "cover URL is missing" end
+    local ready, dir_err = self:_ensureDir()
+    if not ready then return nil, dir_err end
+
+    local path = self.dir .. "/" .. key .. ".thumb.png"
+    local temporary = self.dir .. "/" .. key .. ".thumb.part.png"
+    self.remove_file(temporary)
+    local rendered, render_result, render_err = pcall(
+        self.render_thumbnail,
+        source,
+        temporary,
+        self.THUMBNAIL_WIDTH,
+        self.THUMBNAIL_HEIGHT
+    )
+    if not rendered or not render_result or not valid_cached_file(temporary) then
+        self.remove_file(temporary)
+        return nil, tostring(render_err or render_result or "cover thumbnail failed")
+    end
+    local renamed, rename_err = self.rename_file(temporary, path)
+    if not renamed then
+        self.remove_file(temporary)
+        return nil, tostring(rename_err or "cover thumbnail commit failed")
+    end
+
+    -- Remove old full-resolution cache entries only after the thumbnail has
+    -- been committed atomically.
+    for _, extension in ipairs(extensions) do
+        local legacy = self.dir .. "/" .. key .. "." .. extension
+        if legacy ~= source then self.remove_file(legacy) end
+    end
+    if source ~= path then self.remove_file(source) end
+    return path
+end
+
+function CoverCache:thumbnailFromCached(book)
+    local cached = self:pathFor(book)
+    if cached then return cached end
+    local source = self:sourcePathFor(book)
+    if not source then return nil, "cached cover source is missing" end
+    return self:_thumbnailFromSource(book, source)
 end
 
 function CoverCache:store(book, data)
@@ -64,14 +130,9 @@ function CoverCache:store(book, data)
     end
     local extension = image_extension(data)
     if not extension then return nil, "unsupported cover image" end
-    if not lfs.attributes(self.dir, "mode") then
-        local created, mkdir_err = lfs.mkdir(self.dir)
-        if not created and not lfs.attributes(self.dir, "mode") then
-            return nil, tostring(mkdir_err or "cover cache directory creation failed")
-        end
-    end
-    local path = self.dir .. "/" .. key .. "." .. extension
-    local temporary = path .. ".part"
+    local ready, dir_err = self:_ensureDir()
+    if not ready then return nil, dir_err end
+    local temporary = self.dir .. "/" .. key .. ".source.part." .. extension
     local file, open_err = self.open_file(temporary, "wb")
     if not file then return nil, tostring(open_err or "cover cache open failed") end
     local wrote, write_err = file:write(data)
@@ -80,12 +141,9 @@ function CoverCache:store(book, data)
         self.remove_file(temporary)
         return nil, tostring(write_err or close_err or "cover cache write failed")
     end
-    local renamed, rename_err = self.rename_file(temporary, path)
-    if not renamed then
-        self.remove_file(temporary)
-        return nil, tostring(rename_err or "cover cache commit failed")
-    end
-    return path
+    local path, thumbnail_err = self:_thumbnailFromSource(book, temporary)
+    if not path then self.remove_file(temporary) end
+    return path, thumbnail_err
 end
 
 function CoverCache:prune(max_bytes)
