@@ -265,6 +265,7 @@ function M:fetchVisibleShelfCovers(view, books, options)
                         skip_cookie = true,
                         persist_response_cookies = false,
                         timeout = { 8, 12 },
+                        max_bytes = cache.MAX_IMAGE_BYTES,
                     })
                 end)
                 if downloaded then ok, path = pcall(cache.store, cache, book, data) end

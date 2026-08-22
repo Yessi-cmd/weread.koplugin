@@ -643,6 +643,17 @@ function Downloader:_finishChapter(dl)
         self:_failChapter(dl, xhtml)
         return
     end
+    local chapter_asset_bytes = 0
+    for _i, asset in ipairs(chapter_assets or {}) do
+        chapter_asset_bytes = chapter_asset_bytes
+            + (tonumber(asset.size)
+                or (type(asset.data) == "string" and #asset.data or 0))
+    end
+    local max_asset_bytes = math.max(16,
+        tonumber(cache.max_size_mb) or 1024) * 1024 * 1024
+    if (tonumber(dl.asset_bytes) or 0) + chapter_asset_bytes > max_asset_bytes then
+        error(_("Book images exceed the configured cache safety limit."))
+    end
     local uid = tostring(chapter.chapterUid or dl.index)
     dl.bodies[uid] = xhtml
     dl.assets_by_uid = dl.assets_by_uid or {}
@@ -650,7 +661,9 @@ function Downloader:_finishChapter(dl)
     table.insert(dl.selected, chapter)
     for _i, asset in ipairs(chapter_assets or {}) do
         table.insert(dl.assets, asset)
-        dl.asset_bytes = (dl.asset_bytes or 0) + (tonumber(asset.size) or 0)
+        dl.asset_bytes = (dl.asset_bytes or 0)
+            + (tonumber(asset.size)
+                or (type(asset.data) == "string" and #asset.data or 0))
     end
     logger.info("download assets staged:",
         "chapter=", tostring(dl.index) .. "/" .. tostring(dl.total),
@@ -876,7 +889,11 @@ function Downloader:_step(dl)
             local cover_data
             local cover_url = WeRead.normalize_cover_url(dl.book.cover)
             if cover_url and cover_url ~= "" then
-                pcall(function() cover_data = self.client:get_binary(cover_url) end)
+                pcall(function()
+                    cover_data = self.client:get_binary(cover_url, {
+                        max_bytes = Content.MAX_COVER_IMAGE_BYTES,
+                    })
+                end)
             end
             return Content.save_book_epub(
                 self.settings, dl.book, dl.selected, dl.bodies,

@@ -47,7 +47,7 @@ local function expect(value, label)
     end
 end
 
-expect(shown and shown.title == "WeRead · Quick menu",
+expect(shown and shown.title == "weread-yessi · Quick menu",
     "quick menu keeps the requested title")
 local sync_row = shown and shown.buttons[#shown.buttons - 1]
 expect(sync_row and #sync_row == 2,

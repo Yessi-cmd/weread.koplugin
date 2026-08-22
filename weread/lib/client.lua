@@ -255,9 +255,22 @@ function Client:request(opts)
     socketutil:set_timeout(block_timeout, total_timeout)
 
     local sink_to_use = opts.sink
+    local response_too_large = false
     if not sink_to_use then
         response = {}
-        sink_to_use = socketutil.table_sink(response)
+        local response_bytes = 0
+        local max_bytes = tonumber(opts.max_bytes)
+        sink_to_use = function(chunk)
+            if not chunk then return 1 end
+            if max_bytes and max_bytes >= 0
+                and response_bytes + #chunk > max_bytes then
+                response_too_large = true
+                return nil, "download exceeds maximum allowed size"
+            end
+            response[#response + 1] = chunk
+            response_bytes = response_bytes + #chunk
+            return 1
+        end
     end
 
     local req_opts = merge_req_opts({
@@ -269,6 +282,7 @@ function Client:request(opts)
     -- Redirects are handled explicitly by request_follow so credentials can be
     -- rebuilt for every destination instead of being copied across origins.
     req_opts.redirect = false
+    req_opts.max_bytes = nil
     local diagnostic_api = req_opts.diagnostic_api
     req_opts.diagnostic_api = nil
 
@@ -283,6 +297,9 @@ function Client:request(opts)
             "error=", tostring(results[2])
         )
         error(results[2])
+    end
+    if response_too_large then
+        error("download exceeds maximum allowed size")
     end
     local _, raw_code, resp_headers, status = results[2], results[3], results[4], results[5]
     if status == nil and type(raw_code) == "string" then
@@ -515,6 +532,10 @@ function Client:get_binary(url, opts)
         merge_req_opts(req_opts, { url = url, method = "GET" })
     )
     if code and code >= 200 and code < 300 then
+        local max_bytes = tonumber(opts.max_bytes)
+        if max_bytes and max_bytes >= 0 and #(text or "") > max_bytes then
+            error("download exceeds maximum allowed size")
+        end
         return text, code, resp_headers
     end
     error(http_error(self, code, text, resp_headers))

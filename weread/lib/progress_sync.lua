@@ -11,6 +11,7 @@ local BUSY_RETRY_SECONDS = 2
 local BUSY_RETRY_LIMIT = 10
 local SAME_THRESHOLD_PERCENT = 2
 local SOURCE_CONFLICT_THRESHOLD_PERCENT = 2
+local SECONDS_PER_MINUTE = 60
 
 local function log(level, ...)
     if type(logger[level]) == "function" then
@@ -66,6 +67,7 @@ function ProgressSync:new(options)
         goto_fraction = options.goto_fraction,
         open_chapter = options.open_chapter,
         is_online = options.is_online or function() return true end,
+        is_time_reporting = options.is_time_reporting or function() return false end,
         on_choice = options.on_choice or function(context)
             context.keep_local()
         end,
@@ -81,6 +83,67 @@ end
 
 function ProgressSync:_config()
     return self.settings:get("sync", {})
+end
+
+function ProgressSync:_periodic_upload_delay()
+    local minutes = tonumber(self:_config().upload_interval_minutes) or 0
+    if minutes <= 0 then return nil end
+    return math.max(1, minutes) * SECONDS_PER_MINUTE
+end
+
+function ProgressSync:_time_report_covers_book(book_id)
+    local ok, covered = pcall(self.is_time_reporting, tostring(book_id or ""))
+    return ok and covered == true
+end
+
+function ProgressSync:_cancel_periodic_upload()
+    local task = self.periodic_upload_task
+    self.periodic_upload_task = nil
+    if task and type(self.scheduler.unschedule) == "function" then
+        pcall(self.scheduler.unschedule, self.scheduler, task)
+    end
+end
+
+-- Page turns only update the latest immutable snapshot. At most one timer is
+-- kept for the current document, so normal reading produces one upload per
+-- configured interval instead of one request per page. Reading-time reports
+-- already carry the live position and therefore suppress this extra heartbeat.
+function ProgressSync:_schedule_periodic_upload()
+    if self.periodic_upload_task or self.suspended or self.uploading
+        or not self.verified or not self.dirty or not self.current_book_id then
+        return false
+    end
+    local delay = self:_periodic_upload_delay()
+    if not delay or self:_time_report_covers_book(self.current_book_id) then
+        return false
+    end
+
+    local generation = self.generation
+    local book_id = tostring(self.current_book_id)
+    local task
+    task = function()
+        if self.periodic_upload_task ~= task then return end
+        self.periodic_upload_task = nil
+        if generation ~= self.generation or self.suspended
+            or tostring(self.current_book_id or "") ~= book_id then
+            return
+        end
+        local position = self:capture_local() or self.local_position
+        if not position or not self.dirty then return end
+        self.local_position = copy(position)
+        local started = self:_upload_snapshot(position, "periodic", false)
+        if not started and self.dirty then
+            self:_schedule_periodic_upload()
+        end
+    end
+    self.periodic_upload_task = task
+    self.scheduler:scheduleIn(delay, task)
+    return true
+end
+
+function ProgressSync:on_upload_policy_changed()
+    self:_cancel_periodic_upload()
+    self:_schedule_periodic_upload()
 end
 
 function ProgressSync:_persist(book_id, patch)
@@ -368,8 +431,10 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
         self.uploading = false
         if ok and accepted then
             self.state = "verified"
-            self.dirty = false
             self.last_uploaded_position = copy(position)
+            self.dirty = self.local_position ~= nil
+                and not PositionMapper.same_position(
+                    self.local_position, position)
             self:_persist(book_id, {
                 last_local_position = position,
                 last_uploaded_position = position,
@@ -385,6 +450,7 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
             if show_result then
                 self.notify("upload_success", { position = position })
             end
+            self:_schedule_periodic_upload()
             return
         end
         local error_message = ok and type(outcome) == "table"
@@ -399,6 +465,7 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
                 error = tostring(error_message or "upload_failed"),
             })
         end
+        self:_schedule_periodic_upload()
     end
     local started = self.run_online("progress_upload", attempt)
     if not started then
@@ -633,6 +700,7 @@ function ProgressSync:cancel_pending_jump(reason)
 end
 
 function ProgressSync:on_reader_ready()
+    self:_cancel_periodic_upload()
     self.generation = self.generation + 1
     local generation = self.generation
     self.current_book_id = nil
@@ -679,9 +747,11 @@ function ProgressSync:on_page_update()
         self.dirty = true
     end
     self.local_position = position
+    self:_schedule_periodic_upload()
 end
 
 function ProgressSync:on_close_document()
+    self:_cancel_periodic_upload()
     local position = self:capture_local() or self.local_position
     if position and self.verified
         and self:_config().upload_on_close == true then
@@ -702,6 +772,8 @@ function ProgressSync:on_close_document()
 end
 
 function ProgressSync:on_suspend()
+    self.suspended = true
+    self:_cancel_periodic_upload()
     self.suspended_at = self.now()
     local position = self:capture_local() or self.local_position
     if position and self.local_position
@@ -715,13 +787,16 @@ function ProgressSync:on_suspend()
 end
 
 function ProgressSync:on_resume()
+    self.suspended = false
     local slept = self.suspended_at and self.now() - self.suspended_at or 0
     self.suspended_at = nil
     if slept >= RESUME_RECHECK_SECONDS
         and self:_config().pull_on_open == true then
         self:_clear_verified("resume_recheck")
         self:_pull({ manual = false })
+        return
     end
+    self:_schedule_periodic_upload()
 end
 
 function ProgressSync:sync_now()
@@ -757,6 +832,9 @@ function ProgressSync:status()
         dirty = self.dirty,
         pulling = self.pulling == true,
         uploading = self.uploading == true,
+        periodic_upload_scheduled = self.periodic_upload_task ~= nil,
+        upload_interval_minutes = tonumber(
+            self:_config().upload_interval_minutes) or 0,
         local_position = copy(self.local_position),
         remote_position = copy(self.remote_position),
     }

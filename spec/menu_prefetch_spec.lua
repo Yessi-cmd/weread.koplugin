@@ -4,6 +4,7 @@ package.path = "./?.lua;" .. package.path
 
 local registered = {}
 local shown_widget
+local selected_language
 package.preload["dispatcher"] = function()
     return {
         registerAction = function(_self, name, action)
@@ -42,6 +43,7 @@ package.preload["weread.lib.plugin_util"] = function()
     return {
         tr = function(text) return text end,
         T = function(text) return text end,
+        set_language = function(language) selected_language = language end,
     }
 end
 
@@ -57,29 +59,46 @@ local function expect(value, label)
 end
 
 local cache = {
+    book_layout_mode = "smart",
     auto_prefetch_next_chapter = false,
     download_underlines_and_thoughts = false,
     show_prefetch_notifications = true,
 }
 local shelf = { sort_order = "time_desc" }
+local sync = { upload_interval_minutes = 1 }
+local language = "zh"
 local flush_count = 0
+local upload_policy_updates = 0
+local transient_message
 local available_version
 local host = {
     ui = {},
     version = "test",
+    private_build = true,
     settings = {
         get = function(_self, key, default)
             if key == "cache" then return cache end
             if key == "shelf" then return shelf end
+            if key == "sync" then return sync end
+            if key == "language" then return language end
             return default
         end,
         set = function(_self, key, value)
+            if key == "cache" then cache = value end
             if key == "shelf" then shelf = value end
+            if key == "sync" then sync = value end
+            if key == "language" then language = value end
         end,
         flush = function() flush_count = flush_count + 1 end,
     },
     downloader = { cancelPrefetch = function() end },
+    progress_sync = {
+        on_upload_policy_changed = function()
+            upload_policy_updates = upload_policy_updates + 1
+        end,
+    },
     updater = { available_version = function() return available_version end },
+    showTransientInfo = function(_self, message) transient_message = message end,
     safeCallback = function(_self, _label, callback) return callback end,
 }
 for key, value in pairs(Menu) do host[key] = value end
@@ -97,7 +116,7 @@ expect(quick_action and quick_action.event == "ShowWeReadQuickMenu",
 expect(quick_action and quick_action.reader == true
         and quick_action.general ~= true,
     "quick menu action remains reader-only")
-expect(quick_action and quick_action.title == "WeRead · Quick menu",
+expect(quick_action and quick_action.title == "weread-yessi · Quick menu",
     "quick menu action has the requested title")
 local toggle_action = registered.weread_toggle_annotations
 expect(toggle_action and toggle_action.event == "ToggleWeReadAnnotations",
@@ -106,7 +125,7 @@ expect(toggle_action and toggle_action.reader == true
         and toggle_action.general ~= true,
     "annotation visibility action is reader-only")
 expect(toggle_action
-        and toggle_action.title == "WeRead · Toggle underlines and thoughts",
+        and toggle_action.title == "weread-yessi · Toggle underlines and thoughts",
     "annotation visibility action has a gesture-friendly title")
 local bookshelf_action = registered.weread_bookshelf
 expect(bookshelf_action and bookshelf_action.event == "ShowWeReadBookshelf",
@@ -114,20 +133,20 @@ expect(bookshelf_action and bookshelf_action.event == "ShowWeReadBookshelf",
 expect(bookshelf_action and bookshelf_action.general == true
         and bookshelf_action.reader ~= true,
     "bookshelf action is grouped with the general WeRead actions")
-expect(bookshelf_action and bookshelf_action.title == "WeRead · Bookshelf",
+expect(bookshelf_action and bookshelf_action.title == "weread-yessi · Bookshelf",
     "bookshelf gesture action has the requested title")
 local general_actions = {
     weread_local_bookshelf = {
         event = "ShowWeReadLocalBookshelf",
-        title = "WeRead · Local bookshelf",
+        title = "weread-yessi · Local bookshelf",
     },
     weread_reading_statistics = {
         event = "ShowWeReadReadingStatistics",
-        title = "WeRead · Reading statistics",
+        title = "weread-yessi · Reading statistics",
     },
     weread_search = {
         event = "ShowWeReadSearch",
-        title = "WeRead · Search",
+        title = "weread-yessi · Search",
     },
 }
 for name, expected in pairs(general_actions) do
@@ -181,12 +200,43 @@ expect(shelf.paginated == true and flush_count == 3,
 view_items[1].callback({ updateItems = function() end })
 expect(view_items[3].enabled_func(),
     "list browsing preference is enabled again in list view")
+local language_item = settings_items[2]
+expect(language_item.text_func() == "Interface language · Simplified Chinese",
+    "plugin language preference defaults to Simplified Chinese")
+local language_items = language_item.sub_item_table_func()
+language_items[2].callback({ updateItems = function() end })
+expect(language == "en" and selected_language == "en",
+    "English plugin language was saved and applied")
+local progress_item
+for _, item in ipairs(settings_items) do
+    if item.text == "Progress management" then progress_item = item end
+end
+local progress_items = progress_item and progress_item.sub_item_table_func() or {}
+expect(progress_items[2] and progress_items[2].text_func():find("Every %1 minute(s)", 1, true),
+    "progress menu exposes the periodic upload interval")
+local interval_items = progress_items[2].sub_item_table_func()
+interval_items[3].callback({ updateItems = function() end })
+expect(sync.upload_interval_minutes == 2 and upload_policy_updates == 1,
+    "periodic upload interval was saved and applied")
+local download_item
+for _, item in ipairs(settings_items) do
+    if item.text == "Download settings" then download_item = item end
+end
+local download_items = download_item and download_item.sub_item_table_func() or {}
+expect(download_items[1]
+        and download_items[1].text_func() == "Book layout · Smart restoration",
+    "download settings expose smart book layout by default")
+local layout_items = download_items[1].sub_item_table_func()
+layout_items[2].callback({ updateItems = function() end })
+expect(cache.book_layout_mode == "original"
+        and transient_message == "Layout changes apply to newly downloaded books.",
+    "original layout mode was saved and explained")
 local last_settings_item = settings_items[#settings_items]
 expect(last_settings_item and last_settings_item.text == "About",
     "about is the last settings menu item")
 local about_items = last_settings_item and last_settings_item.sub_item_table_func()
-expect(about_items and #about_items == 5,
-    "about contains version, author, and three update settings")
+expect(about_items and #about_items == 3,
+    "private about contains version, author, and manual-update status")
 for index, item in ipairs(about_items or {}) do
     expect(item.keep_menu_open == true,
         "about item " .. index .. " keeps the menu open")
@@ -195,15 +245,16 @@ expect(about_items[1] and about_items[1].text == "Version %1",
     "version is the first about item")
 expect(about_items[2] and about_items[2].text == "Author: %1",
     "author is the second about item")
-expect(about_items[3] and about_items[3].text == "Check for updates"
-        and about_items[4].text == "Automatically check once a day"
-        and about_items[5].text == "Prefer proxy for updates",
-    "update settings follow version and author at the same level")
+expect(about_items[3]
+        and about_items[3].text == "Private edition · Manual updates only"
+        and about_items[3].enabled_func
+        and not about_items[3].enabled_func(),
+    "private build cannot be overwritten by the public online updater")
 available_version = "0.7.0"
 local update_available_items = last_settings_item.sub_item_table_func()
-expect(#update_available_items == 5
-        and update_available_items[3].text == "Update to v%1",
-    "available update replaces the check item without adding a sixth item")
+expect(#update_available_items == 3
+        and update_available_items[3].text == "Private edition · Manual updates only",
+    "cached public releases stay hidden in a private build")
 available_version = nil
 about_items[1].callback()
 expect(shown_widget and shown_widget.text:find("Disclaimer", 1, true),

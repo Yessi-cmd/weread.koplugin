@@ -18,44 +18,44 @@ function M:onDispatcherRegisterActions()
     Dispatcher:registerAction("weread_quick_menu", {
         category = "none",
         event = "ShowWeReadQuickMenu",
-        title = _("WeRead · Quick menu"),
+        title = _("weread-yessi · Quick menu"),
         reader = true,
     })
     Dispatcher:registerAction("weread_bookshelf", {
         category = "none",
         event = "ShowWeReadBookshelf",
-        title = _("WeRead · Bookshelf"),
+        title = _("weread-yessi · Bookshelf"),
         general = true,
     })
     Dispatcher:registerAction("weread_local_bookshelf", {
         category = "none",
         event = "ShowWeReadLocalBookshelf",
-        title = _("WeRead · Local bookshelf"),
+        title = _("weread-yessi · Local bookshelf"),
         general = true,
     })
     Dispatcher:registerAction("weread_reading_statistics", {
         category = "none",
         event = "ShowWeReadReadingStatistics",
-        title = _("WeRead · Reading statistics"),
+        title = _("weread-yessi · Reading statistics"),
         general = true,
     })
     Dispatcher:registerAction("weread_search", {
         category = "none",
         event = "ShowWeReadSearch",
-        title = _("WeRead · Search"),
+        title = _("weread-yessi · Search"),
         general = true,
     })
     Dispatcher:registerAction("weread_toggle_annotations", {
         category = "none",
         event = "ToggleWeReadAnnotations",
-        title = _("WeRead · Toggle underlines and thoughts"),
+        title = _("weread-yessi · Toggle underlines and thoughts"),
         reader = true,
     })
 end
 
 function M:addToMainMenu(menu_items)
     menu_items.weread = {
-        text = _("WeRead"),
+        text = _("weread-yessi"),
         sorting_hint = "tools",
         sub_item_table_func = function()
             return self:getMainMenuItems()
@@ -254,6 +254,48 @@ function M:getSettingsMenuItems()
             end,
         },
         {
+            text_func = function()
+                local language = self.settings:get("language", "zh")
+                local label = language == "en" and _("English")
+                    or _("Simplified Chinese")
+                return _("Interface language") .. " · " .. label
+            end,
+            sub_item_table_func = function()
+                local function set_language(language)
+                    return self:safeCallback(_("Interface language"),
+                        function(touchmenu_instance)
+                            self.settings:set("language", language)
+                            self.settings:flush()
+                            PluginUtil.set_language(language)
+                            if touchmenu_instance then
+                                touchmenu_instance:updateItems()
+                            end
+                            if type(self.refreshUI) == "function" then
+                                self:refreshUI()
+                            end
+                        end)
+                end
+                return {
+                    {
+                        text = _("Simplified Chinese"),
+                        checked_func = function()
+                            return self.settings:get("language", "zh") ~= "en"
+                        end,
+                        keep_menu_open = true,
+                        callback = set_language("zh"),
+                    },
+                    {
+                        text = _("English"),
+                        checked_func = function()
+                            return self.settings:get("language", "zh") == "en"
+                        end,
+                        keep_menu_open = true,
+                        callback = set_language("en"),
+                    },
+                }
+            end,
+        },
+        {
             text = _("Cache management"),
             sub_item_table_func = function()
                 return {
@@ -306,6 +348,52 @@ function M:getSettingsMenuItems()
                             end),
                      },
                     {
+                        text_func = function()
+                            local minutes = tonumber(
+                                self.settings:get("sync").upload_interval_minutes) or 0
+                            local value = minutes > 0
+                                and T(_("Every %1 minute(s)"), tostring(minutes))
+                                or _("Periodic upload disabled")
+                            return _("Upload progress while reading") .. " · " .. value
+                        end,
+                        sub_item_table_func = function()
+                            local options = {
+                                { minutes = 0, text = _("Off") },
+                                { minutes = 1, text = T(_("Every %1 minute(s)"), "1") },
+                                { minutes = 2, text = T(_("Every %1 minute(s)"), "2") },
+                                { minutes = 5, text = T(_("Every %1 minute(s)"), "5") },
+                            }
+                            local items = {}
+                            for _i, option in ipairs(options) do
+                                local minutes = option.minutes
+                                items[#items + 1] = {
+                                    text = option.text,
+                                    checked_func = function()
+                                        local sync = self.settings:get("sync")
+                                        return (tonumber(sync.upload_interval_minutes) or 0)
+                                            == minutes
+                                    end,
+                                    keep_menu_open = true,
+                                    callback = self:safeCallback(
+                                        _("Upload progress while reading"),
+                                        function(touchmenu_instance)
+                                            local sync = self.settings:get("sync")
+                                            sync.upload_interval_minutes = minutes
+                                            self.settings:set("sync", sync)
+                                            self.settings:flush()
+                                            if self.progress_sync then
+                                                self.progress_sync:on_upload_policy_changed()
+                                            end
+                                            if touchmenu_instance then
+                                                touchmenu_instance:updateItems()
+                                            end
+                                        end),
+                                }
+                            end
+                            return items
+                        end,
+                    },
+                    {
                         text = _("Upload progress on close"),
                         keep_menu_open = true,
                         check_callback_updates_menu = true,
@@ -331,6 +419,51 @@ function M:getSettingsMenuItems()
             text = _("Download settings"),
             sub_item_table_func = function()
                 return {
+                    {
+                        text_func = function()
+                            local mode = self.settings:get("cache").book_layout_mode
+                                or "smart"
+                            local labels = {
+                                smart = _("Smart restoration"),
+                                original = _("Preserve original layout"),
+                                clean = _("Clean reading"),
+                            }
+                            return _("Book layout") .. " · "
+                                .. (labels[mode] or labels.smart)
+                        end,
+                        sub_item_table_func = function()
+                            local options = {
+                                { mode = "smart", text = _("Smart restoration") },
+                                { mode = "original", text = _("Preserve original layout") },
+                                { mode = "clean", text = _("Clean reading") },
+                            }
+                            local items = {}
+                            for _i, option in ipairs(options) do
+                                local mode = option.mode
+                                items[#items + 1] = {
+                                    text = option.text,
+                                    checked_func = function()
+                                        return (self.settings:get("cache").book_layout_mode
+                                            or "smart") == mode
+                                    end,
+                                    keep_menu_open = true,
+                                    callback = self:safeCallback(_("Book layout"),
+                                        function(touchmenu_instance)
+                                            local cache = self.settings:get("cache")
+                                            cache.book_layout_mode = mode
+                                            self.settings:set("cache", cache)
+                                            self.settings:flush()
+                                            if touchmenu_instance then
+                                                touchmenu_instance:updateItems()
+                                            end
+                                            self:showTransientInfo(_(
+                                                "Layout changes apply to newly downloaded books."), 2)
+                                        end),
+                                }
+                            end
+                            return items
+                        end,
+                    },
                     {
                         text = _("Book images"),
                         keep_menu_open = true,
@@ -616,7 +749,7 @@ end
 
 function M:showAbout()
     UIManager:show(InfoMessage:new{
-        text = T(_("WeRead Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\nhttps://github.com/finlater/weread.koplugin"), self.version),
+        text = T(_("weread-yessi Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\nhttps://github.com/finlater/weread.koplugin"), self.version),
     })
 end
 
@@ -646,6 +779,13 @@ function M:getAboutMenuItems()
 end
 
 function M:getUpdateMenuItems()
+    if self.private_build then
+        return {{
+            text = _("Private edition · Manual updates only"),
+            keep_menu_open = true,
+            enabled_func = function() return false end,
+        }}
+    end
     local items = {}
     local available = self.updater:available_version()
     if available then

@@ -9,6 +9,9 @@ end
 package.preload["logger"] = function()
     return { info = function() end, warn = function() end, err = function() end }
 end
+package.preload["bit"] = function()
+    return { rshift = function(value, bits) return math.floor(value / 2 ^ bits) end }
+end
 package.preload["weread.lib.crypto"] = function() return {} end
 package.preload["weread.lib.reader_state"] = function() return {} end
 package.preload["weread.lib.protocol"] = function()

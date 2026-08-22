@@ -289,11 +289,18 @@ function M:maybePrefetchNextChapter(book_id)
 end
 
 function M:maybeStartReadReport()
-    return self.read_report:maybe_start("menu")
+    local started, title, reason = self.read_report:maybe_start("menu")
+    if self.progress_sync then
+        self.progress_sync:on_upload_policy_changed()
+    end
+    return started, title, reason
 end
 
 function M:stopReadReport(reason)
     self.read_report:stop(reason or "explicit_stop")
+    if self.progress_sync then
+        self.progress_sync:on_upload_policy_changed()
+    end
 end
 
 function M:onSuspend()
@@ -302,8 +309,11 @@ function M:onSuspend()
 end
 
 function M:onResume()
-    self.progress_sync:on_resume()
     self.read_report:on_resume()
+    -- Restart the reading-time reporter first. ProgressSync can then see that
+    -- its 30-second heartbeat already covers this book and avoid scheduling a
+    -- duplicate periodic progress request after resume.
+    self.progress_sync:on_resume()
 end
 
 function M:detectWeReadBook()

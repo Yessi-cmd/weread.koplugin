@@ -5,7 +5,8 @@ local function _(text)
 end
 
 return {
-    fullname = _("WeRead"),
+    fullname = _("weread-yessi"),
     description = _([[Read WeRead books in KOReader, cache chapters, and sync reading progress.]]),
     version = "1.2.0",
+    private_build = true,
 }

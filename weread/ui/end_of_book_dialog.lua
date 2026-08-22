@@ -121,7 +121,7 @@ function M.show(opts, callbacks)
     })
 
     dialog = ButtonDialog:new{
-        title = _("WeRead · Quick menu"),
+        title = _("weread-yessi · Quick menu"),
         buttons = buttons,
     }
 

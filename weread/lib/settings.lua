@@ -7,9 +7,14 @@ local lfs = require("libs/libkoreader-lfs")
 local Settings = {}
 Settings.__index = Settings
 Settings.AUTH_SCHEMA_VERSION = 1
+Settings.SYNC_SCHEMA_VERSION = 1
+Settings.READ_REPORT_SCHEMA_VERSION = 1
 
 local defaults = {
     auth_schema_version = Settings.AUTH_SCHEMA_VERSION,
+    sync_schema_version = Settings.SYNC_SCHEMA_VERSION,
+    read_report_schema_version = Settings.READ_REPORT_SCHEMA_VERSION,
+    language = "zh",
     api_key = "",
     cookies = {},
     wr_ticket = "",
@@ -23,12 +28,13 @@ local defaults = {
     books = {},
     downloads = {},
     sync = {
-        pull_on_open = false,
+        pull_on_open = true,
         upload_on_close = false,
         ask_on_conflict = true,
-        upload_interval_minutes = 0,
+        upload_interval_minutes = 1,
     },
     cache = {
+        book_layout_mode = "smart",
         download_book_images = true,
         download_mp_images = false,
         download_underlines_and_thoughts = false,
@@ -43,8 +49,8 @@ local defaults = {
         max_size_mb = 1024,
     },
     read_report = {
-        enabled = false,
-        mode = "manual",
+        enabled = true,
+        mode = "auto",
         book_id = "",
         book_title = "",
         interval_seconds = 30,
@@ -83,6 +89,19 @@ local function deepcopy(value)
     return out
 end
 
+local function merge_missing(target, source)
+    local changed = false
+    for key, value in pairs(source or {}) do
+        if target[key] == nil then
+            target[key] = deepcopy(value)
+            changed = true
+        elseif type(value) == "table" and type(target[key]) == "table" then
+            changed = merge_missing(target[key], value) or changed
+        end
+    end
+    return changed
+end
+
 local function ensure_dir(path)
     if not lfs.attributes(path, "mode") then
         lfs.mkdir(path)
@@ -112,36 +131,29 @@ function Settings:new()
     ensure_dir(obj.cache_dir)
     local cache = obj.store:readSetting("cache", deepcopy(defaults.cache))
     local cache_changed = false
-    if cache.download_book_images == nil then
+    if type(cache) ~= "table" then
+        cache = deepcopy(defaults.cache)
+        cache_changed = true
+    end
+    if cache.download_book_images == nil and cache.download_images ~= nil then
         cache.download_book_images = cache.download_images ~= false
         cache_changed = true
     end
-    if cache.download_mp_images == nil then
-        cache.download_mp_images = false
+    cache_changed = merge_missing(cache, defaults.cache) or cache_changed
+    if cache.book_layout_mode ~= "smart"
+        and cache.book_layout_mode ~= "original"
+        and cache.book_layout_mode ~= "clean" then
+        cache.book_layout_mode = defaults.cache.book_layout_mode
         cache_changed = true
     end
-    if cache.download_underlines_and_thoughts == nil then
-        cache.download_underlines_and_thoughts = false
+    local edge_tap_ratio = tonumber(cache.edge_tap_ratio)
+    if not edge_tap_ratio or edge_tap_ratio < 0.10 or edge_tap_ratio > 0.40 then
+        cache.edge_tap_ratio = defaults.cache.edge_tap_ratio
         cache_changed = true
     end
-    if cache.auto_prefetch_next_chapter == nil then
-        cache.auto_prefetch_next_chapter = false
-        cache_changed = true
-    end
-    if cache.show_prefetch_notifications == nil then
-        cache.show_prefetch_notifications = true
-        cache_changed = true
-    end
-    if cache.show_annotations == nil then
-        cache.show_annotations = true
-        cache_changed = true
-    end
-    if cache.ignore_edge_thought_taps == nil then
-        cache.ignore_edge_thought_taps = true
-        cache_changed = true
-    end
-    if cache.edge_tap_ratio == nil then
-        cache.edge_tap_ratio = 0.20
+    local max_size_mb = tonumber(cache.max_size_mb)
+    if not max_size_mb or max_size_mb < 16 or max_size_mb > 4096 then
+        cache.max_size_mb = defaults.cache.max_size_mb
         cache_changed = true
     end
     if cache.download_images ~= nil then
@@ -150,6 +162,61 @@ function Settings:new()
     end
     if cache_changed then
         obj.store:saveSetting("cache", cache)
+        obj.store:flush()
+    end
+    local stored_sync_version = tonumber(
+        obj.store:readSetting("sync_schema_version", 0)) or 0
+    if stored_sync_version < Settings.SYNC_SCHEMA_VERSION then
+        local sync = obj.store:readSetting("sync", deepcopy(defaults.sync))
+        if type(sync) ~= "table" then sync = deepcopy(defaults.sync) end
+        -- Activate a verified open-time pull and the throttled heartbeat once
+        -- for upgrades. Both remain user-controllable from the progress menu.
+        sync.pull_on_open = true
+        sync.upload_interval_minutes = defaults.sync.upload_interval_minutes
+        obj.store:saveSetting("sync", sync)
+        obj.store:saveSetting("sync_schema_version", Settings.SYNC_SCHEMA_VERSION)
+        obj.store:flush()
+    end
+    local sync = obj.store:readSetting("sync", deepcopy(defaults.sync))
+    local sync_changed = false
+    if type(sync) ~= "table" then
+        sync = deepcopy(defaults.sync)
+        sync_changed = true
+    end
+    sync_changed = merge_missing(sync, defaults.sync) or sync_changed
+    local interval = tonumber(sync.upload_interval_minutes)
+    if interval ~= 0 and interval ~= 1 and interval ~= 2 and interval ~= 5 then
+        sync.upload_interval_minutes = defaults.sync.upload_interval_minutes
+        sync_changed = true
+    elseif sync.upload_interval_minutes ~= interval then
+        sync.upload_interval_minutes = interval
+        sync_changed = true
+    end
+    if sync_changed then
+        obj.store:saveSetting("sync", sync)
+        obj.store:flush()
+    end
+    local stored_report_version = tonumber(
+        obj.store:readSetting("read_report_schema_version", 0)) or 0
+    if stored_report_version < Settings.READ_REPORT_SCHEMA_VERSION then
+        local report = obj.store:readSetting(
+            "read_report", deepcopy(defaults.read_report))
+        if type(report) ~= "table" then
+            report = deepcopy(defaults.read_report)
+        else
+            merge_missing(report, defaults.read_report)
+            -- Preserve a deliberately selected manual target. Otherwise make
+            -- this private build useful for daily reading records immediately.
+            if tostring(report.book_id or "") == "" then
+                report.mode = "auto"
+                report.book_title = ""
+            end
+            report.enabled = true
+            report.report_on_open = true
+        end
+        obj.store:saveSetting("read_report", report)
+        obj.store:saveSetting(
+            "read_report_schema_version", Settings.READ_REPORT_SCHEMA_VERSION)
         obj.store:flush()
     end
     local legacy_changed = false

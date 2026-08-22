@@ -356,4 +356,11 @@ end)
 expect(not ok and io.open(download_path .. ".part", "rb") == nil,
     "oversized file download did not remove its partial output")
 
+responses[#responses + 1] = { body = "too-large", code = 200 }
+local binary_ok, binary_err = pcall(function()
+    client:get_binary("https://weread.qq.com/large-memory", { max_bytes = 2 })
+end)
+expect(not binary_ok and tostring(binary_err):find("maximum allowed size", 1, true),
+    "oversized in-memory binary response was accepted")
+
 print(("client_spec: %d checks"):format(checks))

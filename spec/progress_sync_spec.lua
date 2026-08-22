@@ -52,6 +52,7 @@ local function fixture(remote, options)
             pull_on_open = true,
             upload_on_close = true,
             ask_on_conflict = true,
+            upload_interval_minutes = options.upload_interval_minutes or 0,
         },
         books = { book = book },
     }
@@ -118,6 +119,7 @@ local function fixture(remote, options)
             notifications[#notifications + 1] = { code = code, data = data }
         end,
         is_online = options.is_online,
+        is_time_reporting = options.is_time_reporting,
     }
     local function drain()
         local count = 0
@@ -216,6 +218,98 @@ test("page change uploads once on close", function()
     eq(f.uploads[1].chapter_uid, 33, "close uploads current chapter")
     eq(f.values.books.book.pending_upload_position, nil,
         "successful upload clears pending snapshot")
+end)
+
+test("dirty progress uploads after the configured reading interval", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 25,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 150,
+        updateTime = 10,
+    }, { upload_interval_minutes = 1 })
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 40
+    f.sync:on_page_update()
+    eq(#f.uploads, 0, "page turn is throttled")
+    eq(f.sync:status().periodic_upload_scheduled, true,
+        "periodic upload scheduled")
+    f.document.page = 45
+    f.sync:on_page_update()
+    f.drain()
+    eq(#f.uploads, 1, "periodic upload sent once")
+    eq(f.uploads[1].percent, 45, "periodic upload uses latest position")
+    eq(f.sync:status().dirty, false, "accepted heartbeat clears dirty state")
+end)
+
+test("periodic upload can be disabled", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 25,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 150,
+        updateTime = 10,
+    }, { upload_interval_minutes = 0 })
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 40
+    f.sync:on_page_update()
+    f.drain()
+    eq(#f.uploads, 0, "disabled periodic upload stays local")
+    eq(f.sync:status().periodic_upload_scheduled, false,
+        "disabled policy has no timer")
+end)
+
+test("reading-time heartbeat suppresses duplicate progress upload", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 25,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 150,
+        updateTime = 10,
+    }, {
+        upload_interval_minutes = 1,
+        is_time_reporting = function(book_id) return book_id == "book" end,
+    })
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 40
+    f.sync:on_page_update()
+    f.drain()
+    eq(#f.uploads, 0, "time report owns the live progress heartbeat")
+    eq(f.sync:status().periodic_upload_scheduled, false,
+        "duplicate timer is not scheduled")
+end)
+
+test("starting reading-time reporting cancels an existing progress timer", function()
+    local reporting = false
+    local f = fixture({
+        bookId = "book",
+        progress = 25,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 150,
+        updateTime = 10,
+    }, {
+        upload_interval_minutes = 1,
+        is_time_reporting = function() return reporting end,
+    })
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 40
+    f.sync:on_page_update()
+    eq(f.sync:status().periodic_upload_scheduled, true,
+        "progress timer starts before time reporting")
+    reporting = true
+    f.sync:on_upload_policy_changed()
+    f.drain()
+    eq(#f.uploads, 0, "cancelled timer does not upload")
+    eq(f.sync:status().periodic_upload_scheduled, false,
+        "time reporting owns subsequent heartbeats")
 end)
 
 test("remote choice jumps and verifies before reporting", function()

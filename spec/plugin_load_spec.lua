@@ -32,6 +32,10 @@ package.preload["logger"] = function()
         err = function() end,
     }
 end
+package.preload["bit"] = function()
+    return { rshift = function(value, bits) return math.floor(value / 2 ^ bits) end }
+end
+package.preload["weread.lib.crypto"] = function() return {} end
 package.preload["ui/uimanager"] = function()
     return {}
 end
@@ -69,6 +73,7 @@ local dispatcher_registered = false
 local menu_registered = false
 local bookshelf_opened = false
 local backup_cleaned = false
+local auto_check_scheduled = false
 
 package.preload["weread.lib.client"] = function()
     return { new = function(_self, settings) return { settings = settings } end }
@@ -93,7 +98,9 @@ end
 package.preload["weread.ui.updater"] = function()
     return {
         new = function(_self, options)
-            options.schedule_auto_check = function() end
+            options.schedule_auto_check = function()
+                auto_check_scheduled = true
+            end
             return options
         end,
     }
@@ -212,6 +219,8 @@ expect(dispatcher_registered, "dispatcher actions were not registered")
 expect(menu_registered, "plugin was not registered in KOReader's main menu")
 expect(backup_cleaned,
     "successful plugin initialization did not clean the update backup")
+expect(not auto_check_scheduled,
+    "private build scheduled a public upstream update check")
 expect(plugin:launch() == true and bookshelf_opened,
     "standard third-party launcher entry did not open the bookshelf")
 expect(type(plugin.openBookshelf) == "function",

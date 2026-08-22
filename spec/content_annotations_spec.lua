@@ -13,6 +13,9 @@ package.preload["logger"] = function()
         err = function() end,
     }
 end
+package.preload["bit"] = function()
+    return { rshift = function(value, bits) return math.floor(value / 2 ^ bits) end }
+end
 package.preload["weread.lib.crypto"] = function() return {} end
 package.preload["weread.lib.reader_state"] = function() return {} end
 package.preload["weread.lib.protocol"] = function()
@@ -81,12 +84,90 @@ expect(xhtml:find("<p>second</p>", 1, true),
     "plain text paragraph conversion lost content")
 
 local rewritten = Content.rewrite_image_sources(
-    '<img src="a.jpg"/><image xlink:href="b.png"/>',
-    { ["a.jpg"] = "../images/a.jpg", ["b.png"] = "../images/b.png" })
+    '<picture><source srcset="a.jpg 1x, a@2x.jpg 2x"/>'
+        .. '<img src="a.jpg"/></picture><image xlink:href="b.png"/>',
+    {
+        ["a.jpg"] = "../images/a.jpg",
+        ["a@2x.jpg"] = "../images/a@2x.jpg",
+        ["b.png"] = "../images/b.png",
+    })
 expect(rewritten:find('src="../images/a.jpg"', 1, true),
     "image source was not rewritten")
+expect(rewritten:find(
+        'srcset="../images/a.jpg 1x, ../images/a@2x.jpg 2x"', 1, true),
+    "responsive image sources were not rewritten")
 expect(rewritten:find('xlink:href="b.png"', 1, true),
     "non-src image attribute should be left unchanged")
+local data_srcset = 'data:image/svg+xml,%3Csvg%3E 1x, https://img.test/a.jpg 2x'
+local preserved_srcset = Content.rewrite_image_sources(
+    '<source srcset="' .. data_srcset .. '"/>',
+    { ["a.jpg"] = "../images/a.jpg" })
+expect(preserved_srcset:find(data_srcset, 1, true),
+    "data URL commas in srcset were parsed as candidate separators")
+local rewritten_css = Content.rewrite_css_sources(
+    '.hero{background-image:url("covers/a.jpg")}.inline{background:url(data:image/png;base64,abc)}',
+    { ["a.jpg"] = "../images/a.jpg" })
+expect(rewritten_css:find('url("images/a.jpg")', 1, true)
+        and rewritten_css:find("url(data:image/png;base64,abc)", 1, true),
+    "CSS image resources were not rewritten safely")
+local remote_xhtml, remote_assets = Content.download_remote_images({
+    get_binary = function(_self, _url) return "\255\216\255jpeg" end,
+}, '<picture><source srcset="https://img.test/a.jpg 1x, https://img.test/b.jpg 2x"/>'
+    .. '<img src="https://img.test/a.jpg"/></picture>', {})
+expect(#remote_assets == 2
+        and remote_xhtml:find("../images/a.jpg 1x", 1, true)
+        and remote_xhtml:find("../images/b.jpg 2x", 1, true),
+    "remote responsive images were not cached and deduplicated")
+expect(Content.is_safe_remote_url("https://img.test/a.jpg")
+        and not Content.is_safe_remote_url("http://127.0.0.1/private")
+        and not Content.is_safe_remote_url("http://192.168.1.2/private")
+        and not Content.is_safe_remote_url("http://localhost/private")
+        and not Content.is_safe_remote_url("file:///etc/passwd"),
+    "remote resource URL guard accepted a local or unsupported target")
+local private_fetches = 0
+local private_xhtml, private_assets = Content.download_remote_images({
+    get_binary = function() private_fetches = private_fetches + 1 end,
+}, '<img src="http://127.0.0.1/private.jpg"/>', {})
+expect(private_fetches == 0 and #private_assets == 0
+        and private_xhtml:find("127.0.0.1", 1, true),
+    "local image URL triggered a network request")
+local previous_image_limit = Content.MAX_REMOTE_IMAGE_BYTES
+Content.MAX_REMOTE_IMAGE_BYTES = 4
+local oversized_xhtml, oversized_assets = Content.download_remote_images({
+    get_binary = function() return "12345" end,
+}, '<img src="https://img.test/large.jpg"/>', {})
+Content.MAX_REMOTE_IMAGE_BYTES = previous_image_limit
+expect(#oversized_assets == 0
+        and oversized_xhtml:find("https://img.test/large.jpg", 1, true),
+    "oversized remote image was embedded")
+local svg_xhtml, svg_assets = Content.download_remote_images({
+    get_binary = function()
+        return '<svg xmlns="http://www.w3.org/2000/svg" onload="bad()">'
+            .. '<script>bad()</script><rect width="1" height="1"/></svg>'
+    end,
+}, '<img src="https://img.test/vector.svg"/>', {})
+expect(#svg_assets == 1 and svg_assets[1].media_type == "image/svg+xml"
+        and not svg_assets[1].data:lower():find("<script", 1, true)
+        and not svg_assets[1].data:lower():find("onload", 1, true)
+        and svg_xhtml:find("../images/vector.svg", 1, true),
+    "active SVG content was not sanitized")
+
+local original_fetch_xhtml = Content.fetch_chapter_xhtml
+local original_fetch_css = Content.fetch_chapter_css
+Content.fetch_chapter_xhtml = function() return "<p>chapter</p>" end
+Content.fetch_chapter_css = function(_client, _settings, _book, chapter)
+    return ".chapter-" .. tostring(chapter.chapterUid) .. "{}"
+end
+local css_state = {}
+Content.fetch_single_chapter_source({}, {}, {}, { chapterUid = 1 }, css_state)
+Content.fetch_single_chapter_source({}, {}, {}, { chapterUid = 2 }, css_state)
+Content.fetch_single_chapter_source({}, {}, {}, { chapterUid = 1 }, css_state)
+expect(css_state.css:find(".chapter%-1{}")
+        and css_state.css:find(".chapter%-2{}")
+        and select(2, css_state.css:gsub("%.chapter%-1{}", "")) == 1,
+    "distinct per-chapter styles were not merged and deduplicated")
+Content.fetch_chapter_xhtml = original_fetch_xhtml
+Content.fetch_chapter_css = original_fetch_css
 
 local body = Content.extract_mp_body(
     '<div id="js_content"><p data-src="x.jpg">article</p>'

@@ -1,4 +1,5 @@
 local Crypto = require("weread.lib.crypto")
+local BookLayout = require("weread.lib.book_layout")
 local ReaderState = require("weread.lib.reader_state")
 local WeRead = require("weread.lib.protocol")
 local Thoughts = require("weread.lib.thoughts")
@@ -6,6 +7,14 @@ local bit = require("bit")
 local logger = require("weread.lib.logger")
 
 local Content = {}
+
+Content.MAX_REMOTE_IMAGE_BYTES = 64 * 1024 * 1024
+Content.MAX_CHAPTER_ARCHIVE_BYTES = 512 * 1024 * 1024
+Content.MAX_CHAPTER_ASSET_BYTES = 512 * 1024 * 1024
+Content.MAX_CHAPTER_IMAGE_BYTES = 64 * 1024 * 1024
+Content.MAX_CHAPTER_IMAGE_COUNT = 4096
+Content.MAX_COVER_IMAGE_BYTES = 16 * 1024 * 1024
+Content.MAX_CHAPTER_SHARD_BYTES = 64 * 1024 * 1024
 
 local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
@@ -181,6 +190,8 @@ local function media_type_for(data)
         return ".gif", "image/gif"
     elseif data:sub(1, 4) == "RIFF" and data:sub(9, 12) == "WEBP" then
         return ".webp", "image/webp"
+    elseif data:sub(1, 512):lower():find("<svg", 1, true) then
+        return ".svg", "image/svg+xml"
     end
     return ".bin", "application/octet-stream"
 end
@@ -188,9 +199,43 @@ end
 local function media_type_for_file(path)
     local file, err = io.open(path, "rb")
     if not file then return nil, nil, err end
-    local head = file:read(12) or ""
+    local head = file:read(512) or ""
     file:close()
     return media_type_for(head)
+end
+
+local function normalized_image_data(data)
+    local ext, media_type = media_type_for(data)
+    if not media_type:match("^image/") then return nil, ext, media_type end
+    if media_type == "image/svg+xml" then
+        if data:lower():find("<!doctype", 1, true) then
+            return nil, ext, media_type
+        end
+        data = BookLayout.sanitize_body(data)
+    end
+    return data, ext, media_type
+end
+
+local function normalize_image_file(path, media_type)
+    if media_type ~= "image/svg+xml" then return true end
+    local input = io.open(path, "rb")
+    if not input then return false end
+    local data = input:read("*a")
+    input:close()
+    local normalized = normalized_image_data(data)
+    if not normalized then return false end
+    local temporary = path .. ".sanitize"
+    local output = io.open(temporary, "wb")
+    if not output then return false end
+    local wrote = output:write(normalized)
+    output:close()
+    if not wrote then
+        os.remove(temporary)
+        return false
+    end
+    local renamed = os.rename(temporary, path)
+    if not renamed then os.remove(temporary) end
+    return renamed == true
 end
 
 local function trim_nulls(value)
@@ -200,6 +245,7 @@ end
 local function tar_entries(data)
     local entries = {}
     local offset = 1
+    local total_size = 0
     while offset + 511 <= #data do
         local header = data:sub(offset, offset + 511)
         if header:match("^%z+$") then
@@ -208,10 +254,19 @@ local function tar_entries(data)
         local name = trim_nulls(header:sub(1, 100))
         local size_text = trim_nulls(header:sub(125, 136)):gsub("%s", "")
         local size = tonumber(size_text, 8) or 0
+        if size < 0 or size > Content.MAX_CHAPTER_IMAGE_BYTES then
+            error("chapter resource archive entry is too large")
+        end
         local typeflag = header:sub(157, 157)
         local body_start = offset + 512
         local body_end = body_start + size - 1
+        if body_end > #data then error("truncated TAR entry") end
         if name ~= "" and (typeflag == "0" or typeflag == "" or typeflag == "\0") and size > 0 then
+            total_size = total_size + size
+            if total_size > Content.MAX_CHAPTER_ASSET_BYTES
+                or #entries >= Content.MAX_CHAPTER_IMAGE_COUNT then
+                error("chapter resource archive exceeds safe limits")
+            end
             table.insert(entries, {
                 name = name,
                 data = data:sub(body_start, body_end),
@@ -220,6 +275,53 @@ local function tar_entries(data)
         offset = body_start + math.ceil(size / 512) * 512
     end
     return entries
+end
+
+local function public_http_url(value)
+    local url = tostring(value or "")
+    if url:match("^//") then url = "https:" .. url end
+    local scheme, remainder = url:match("^([%a]+):(.*)$")
+    scheme = scheme and scheme:lower()
+    if scheme ~= "http" and scheme ~= "https" then return nil end
+    url = scheme .. ":" .. remainder
+    local authority = url:match("^https?://([^/%?#]+)")
+    if not authority or authority == "" or authority:find("%%", 1, true) then return nil end
+    if authority:find("@", 1, true) or authority:sub(1, 1) == "[" then return nil end
+    local host = authority:lower():gsub(":%d+$", ""):gsub("%.$", "")
+    if host == "localhost" or host:match("%.localhost$")
+        or host:match("%.local$") or host:match("%.internal$")
+        or not host:find("%.") then
+        return nil
+    end
+    local raw_a, raw_b, raw_c, raw_d = host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    local a, b, c, d = raw_a, raw_b, raw_c, raw_d
+    if a then
+        if (raw_a:sub(1, 1) == "0" and #raw_a > 1)
+            or (raw_b:sub(1, 1) == "0" and #raw_b > 1)
+            or (raw_c:sub(1, 1) == "0" and #raw_c > 1)
+            or (raw_d:sub(1, 1) == "0" and #raw_d > 1) then
+            return nil
+        end
+        a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+        if a > 255 or b > 255 or c > 255 or d > 255
+            or a == 0 or a == 10 or a == 127 or a >= 224
+            or (a == 100 and b >= 64 and b <= 127)
+            or (a == 169 and b == 254)
+            or (a == 172 and b >= 16 and b <= 31)
+            or (a == 192 and b == 0)
+            or (a == 192 and b == 168)
+            or (a == 198 and (b == 18 or b == 19)) then
+            return nil
+        end
+    elseif host:match("^[%d%.x]+$") then
+        -- Reject abbreviated, integer and hexadecimal IPv4 spellings.
+        return nil
+    end
+    return url
+end
+
+function Content.is_safe_remote_url(value)
+    return public_http_url(value) ~= nil
 end
 
 local function basename(path)
@@ -456,32 +558,7 @@ end
 -- WeRead EPUB chapters may decode to multiple concatenated XHTML documents.
 -- The first <body> is often a title shell; main content lives in later bodies.
 local function body_fragment(xhtml)
-    xhtml = tostring(xhtml or "")
-    local bodies = {}
-    local remaining = xhtml
-    while remaining ~= "" do
-        local body_start = remaining:find("<body", 1, true)
-        if not body_start then
-            break
-        end
-        local body_open_end = remaining:find(">", body_start, true)
-        if not body_open_end then
-            break
-        end
-        local body_close = remaining:find("</body>", body_open_end, true)
-        if not body_close then
-            bodies[#bodies + 1] = remaining:sub(body_open_end + 1)
-            break
-        end
-        bodies[#bodies + 1] = remaining:sub(body_open_end + 1, body_close - 1)
-        remaining = remaining:sub(body_close + 7)
-    end
-    if #bodies > 0 then
-        return table.concat(bodies, "\n")
-    end
-    xhtml = xhtml:gsub("<%?xml.-%?>", "")
-    xhtml = xhtml:gsub("<!DOCTYPE.-%>", "")
-    return xhtml
+    return BookLayout.extract_body(xhtml)
 end
 
 local function checked_body(response_text)
@@ -722,6 +799,15 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (chapter.title or tostring(chapter.chapterUid or "chapter"))) .. ".epub"
     local title = chapter.title or book.title or "WeRead"
     local author = book.author or "WeRead"
+    local layout_mode = BookLayout.mode(settings)
+    local chapter_body, chapter_kind = BookLayout.prepare_body(
+        body_fragment(xhtml), chapter, layout_mode)
+    local book_kind = chapter_kind
+    local body_classes = BookLayout.body_classes(
+        layout_mode, book_kind, chapter_kind)
+    logger.info("chapter layout prepared:",
+        "mode=", layout_mode, "kind=", chapter_kind,
+        "title=", tostring(title))
     local manifest_assets = {}
     for asset_index, asset in ipairs(assets or {}) do
         table.insert(manifest_assets, [[<item id="asset_]] .. tostring(asset_index) .. [[" href="]] .. xml_escape(asset.href) .. [[" media-type="]] .. xml_escape(asset.media_type) .. [["/>]])
@@ -733,8 +819,8 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
 <title>]] .. xml_escape(title) .. [[</title>
 <link rel="stylesheet" type="text/css" href="../style.css"/>
 </head>
-<body>
-]] .. body_fragment(xhtml) .. [[
+<body class="]] .. body_classes .. [[">
+]] .. chapter_body .. [[
 </body>
 </html>]]
     local opf = [[<?xml version="1.0" encoding="utf-8"?>
@@ -767,7 +853,7 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
 </nav>
 </body>
 </html>]]
-    css = css or [[body { line-height: 1.7; margin: 5%; } img { max-width: 100%; }]]
+    css = BookLayout.compose_css(css, layout_mode)
     local entries = {
         { name = "mimetype", data = "application/epub+zip" },
         { name = "META-INF/container.xml", data = [[<?xml version="1.0" encoding="utf-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>]] },
@@ -789,6 +875,11 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
     local book_title = book.title or "WeRead"
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (suffix or "book")) .. ".epub"
     local author = book.author or "WeRead"
+    local layout_mode = BookLayout.mode(settings)
+    local book_kind = BookLayout.classify_book(chapters, chapter_bodies)
+    logger.info("book layout prepared:",
+        "mode=", layout_mode, "kind=", book_kind,
+        "chapters=", tostring(#(chapters or {})))
     local manifest_items = {
         [[<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>]],
         [[<item id="toc" href="toc.ncx" media-type="application/x-dtbncx+xml"/>]],
@@ -801,14 +892,17 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
     }
 
     local cover_meta = ""
-    if cover_data and #cover_data > 0 then
-        local ext, mime = media_type_for(cover_data)
-        local cover_img_href = "images/cover" .. ext
-        table.insert(entries, { name = "OEBPS/" .. cover_img_href, data = cover_data })
-        table.insert(manifest_items, [[<item id="cover-image" href="]] .. xml_escape(cover_img_href) .. [[" media-type="]] .. xml_escape(mime) .. [[" properties="cover-image"/>]])
-        table.insert(manifest_items, [[<item id="cover" href="text/cover.xhtml" media-type="application/xhtml+xml"/>]])
-        table.insert(spine_items, [[<itemref idref="cover"/>]])
-        local cover_xhtml = [[<?xml version="1.0" encoding="utf-8"?>
+    if cover_data and #cover_data > 0
+        and #cover_data <= Content.MAX_COVER_IMAGE_BYTES then
+        local normalized, ext, mime = normalized_image_data(cover_data)
+        cover_data = normalized
+        if cover_data then
+            local cover_img_href = "images/cover" .. ext
+            table.insert(entries, { name = "OEBPS/" .. cover_img_href, data = cover_data })
+            table.insert(manifest_items, [[<item id="cover-image" href="]] .. xml_escape(cover_img_href) .. [[" media-type="]] .. xml_escape(mime) .. [[" properties="cover-image"/>]])
+            table.insert(manifest_items, [[<item id="cover" href="text/cover.xhtml" media-type="application/xhtml+xml"/>]])
+            table.insert(spine_items, [[<itemref idref="cover"/>]])
+            local cover_xhtml = [[<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN">
 <head><title>Cover</title>
@@ -816,8 +910,9 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 </head>
 <body><img src="../]] .. xml_escape(cover_img_href) .. [[" alt="Cover"/></body>
 </html>]]
-        table.insert(entries, { name = "OEBPS/text/cover.xhtml", data = cover_xhtml })
-        cover_meta = '\n<meta name="cover" content="cover-image"/>'
+            table.insert(entries, { name = "OEBPS/text/cover.xhtml", data = cover_xhtml })
+            cover_meta = '\n<meta name="cover" content="cover-image"/>'
+        end
     end
 
     for asset_index, asset in ipairs(assets or {}) do
@@ -830,6 +925,10 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
         local filename = string.format("text/chapter-%03d.xhtml", chapter_index)
         local id = item_id("chapter_", uid)
         local title = chapter.title or ("Chapter " .. uid)
+        local chapter_body, chapter_kind = BookLayout.prepare_body(
+            body_fragment(chapter_bodies[uid] or ""), chapter, layout_mode)
+        local body_classes = BookLayout.body_classes(
+            layout_mode, book_kind, chapter_kind)
         local chapter_xhtml = [[<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="zh-CN">
@@ -837,8 +936,8 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 <title>]] .. xml_escape(title) .. [[</title>
 <link rel="stylesheet" type="text/css" href="../style.css"/>
 </head>
-<body>
-]] .. body_fragment(chapter_bodies[uid] or "") .. [[
+<body class="]] .. body_classes .. [[">
+]] .. chapter_body .. [[
 </body>
 </html>]]
         table.insert(entries, { name = "OEBPS/" .. filename, data = chapter_xhtml })
@@ -893,7 +992,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 </nav>
 </body>
 </html>]]
-    css = css or [[body { line-height: 1.7; margin: 5%; } img { max-width: 100%; }]]
+    css = BookLayout.compose_css(css, layout_mode)
     table.insert(entries, { name = "OEBPS/content.opf", data = opf })
     table.insert(entries, { name = "OEBPS/nav.xhtml", data = nav })
     table.insert(entries, { name = "OEBPS/toc.ncx", data = ncx })
@@ -906,17 +1005,60 @@ function Content.rewrite_image_sources(xhtml, src_map)
     if not src_map or not next(src_map) then
         return xhtml
     end
-    local function replace_src(quote, src)
+    local function mapped_href(src)
         local clean = tostring(src or ""):gsub("&amp;", "&")
         local key = basename(clean:match("^[^%?#]+") or clean)
-        local href = src_map[key]
+        return src_map[key]
+    end
+    local function replace_src(quote, src)
+        local href = mapped_href(src)
         if href then
             return "src=" .. quote .. href .. quote
         end
         return "src=" .. quote .. src .. quote
     end
     xhtml = xhtml:gsub("src=(['\"])(.-)%1", replace_src)
+    xhtml = xhtml:gsub("srcset=(['\"])(.-)%1", function(quote, value)
+        if value:lower():find("data:", 1, true) then
+            return "srcset=" .. quote .. value .. quote
+        end
+        local candidates = {}
+        for candidate in (value .. ","):gmatch("(.-),") do
+            local leading, url, descriptor = candidate:match("^(%s*)(%S+)(.*)$")
+            if url then
+                candidates[#candidates + 1] = leading
+                    .. (mapped_href(url) or url) .. descriptor
+            else
+                candidates[#candidates + 1] = candidate
+            end
+        end
+        return "srcset=" .. quote .. table.concat(candidates, ",") .. quote
+    end)
     return xhtml
+end
+
+function Content.rewrite_css_sources(css, src_map)
+    if type(css) ~= "string" or not src_map or not next(src_map) then
+        return css
+    end
+    return css:gsub("url%s*%((.-)%)", function(raw)
+        local url = raw:match("^%s*(.-)%s*$") or raw
+        local quote = ""
+        local first, last = url:sub(1, 1), url:sub(-1)
+        if (first == '"' or first == "'") and last == first then
+            quote = first
+            url = url:sub(2, -2)
+        end
+        if url:match("^data:") then return "url(" .. raw .. ")" end
+        local clean = url:gsub("&amp;", "&")
+        local key = basename(clean:match("^[^%?#]+") or clean)
+        local href = src_map[key]
+        if not href then return "url(" .. raw .. ")" end
+        -- style.css lives at OEBPS/, while chapter XHTML lives one directory
+        -- deeper, so its resource URL must not retain the chapter's ../ prefix.
+        href = href:gsub("^%.%./", "")
+        return "url(" .. quote .. href .. quote .. ")"
+    end)
 end
 
 function Content.download_remote_images(client, xhtml, used_names, progress)
@@ -925,13 +1067,7 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
     used_names.__remote_image_hrefs = used_names.__remote_image_hrefs or {}
     local remote_image_hrefs = used_names.__remote_image_hrefs
     local function remote_url(src)
-        local url = tostring(src or "")
-        if url:match("^//") then
-            url = "https:" .. url
-        end
-        if url:match("^https?://") then
-            return url
-        end
+        return public_http_url(src)
     end
     local img_total = 0
     xhtml:gsub('src=(["\'])(.-)%1', function(_, src)
@@ -939,33 +1075,41 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
             img_total = img_total + 1
         end
     end)
+    xhtml:gsub('srcset=(["\'])(.-)%1', function(_, value)
+        if value:lower():find("data:", 1, true) then return end
+        for candidate in (value .. ","):gmatch("(.-),") do
+            local url = candidate:match("^%s*(%S+)")
+            if remote_url(url) then img_total = img_total + 1 end
+        end
+    end)
     if img_total == 0 then
         return xhtml, assets
     end
     local index = 0
-    local body = xhtml:gsub('src=(["\'])(.-)%1', function(quote, src)
-        local url = remote_url(src)
-        if not url then
-            return "src=" .. quote .. src .. quote
-        end
+    local function cache_remote(url)
         index = index + 1
         if progress then
             progress(index, img_total)
         end
         local cached_href = remote_image_hrefs[url]
         if cached_href then
-            return "src=" .. quote .. "../" .. cached_href .. quote
+            return "../" .. cached_href
         end
         local ok, data = pcall(function()
-            return client:get_binary(url, { referer = "https://weread.qq.com/" })
+            return client:get_binary(url, {
+                referer = "https://weread.qq.com/",
+                max_bytes = Content.MAX_REMOTE_IMAGE_BYTES,
+            })
         end)
-        if not ok or not data or #data == 0 then
-            return "src=" .. quote .. src .. quote
+        if not ok or not data or #data == 0
+            or #data > Content.MAX_REMOTE_IMAGE_BYTES then
+            return nil
         end
-        local ext, mt = media_type_for(data)
-        if not mt:match("^image/") then
-            return "src=" .. quote .. src .. quote
+        local normalized, ext, mt = normalized_image_data(data)
+        if not normalized then
+            return nil
         end
+        data = normalized
         local seed = basename((url:match("^[^%?#]+") or url))
         local fname = unique_asset_name(used_names, seed ~= "" and seed or ("img" .. tostring(index)), ext)
         local href = "images/" .. fname
@@ -975,7 +1119,30 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
             media_type = mt,
             data = data,
         })
-        return "src=" .. quote .. "../" .. href .. quote
+        return "../" .. href
+    end
+    local body = xhtml:gsub('src=(["\'])(.-)%1', function(quote, src)
+        local url = remote_url(src)
+        local href = url and cache_remote(url)
+        return "src=" .. quote .. (href or src) .. quote
+    end)
+    body = body:gsub('srcset=(["\'])(.-)%1', function(quote, value)
+        if value:lower():find("data:", 1, true) then
+            return "srcset=" .. quote .. value .. quote
+        end
+        local candidates = {}
+        for candidate in (value .. ","):gmatch("(.-),") do
+            local leading, source, descriptor = candidate:match("^(%s*)(%S+)(.*)$")
+            local url = source and remote_url(source)
+            local href = url and cache_remote(url)
+            if source then
+                candidates[#candidates + 1] = leading
+                    .. (href or source) .. descriptor
+            else
+                candidates[#candidates + 1] = candidate
+            end
+        end
+        return "srcset=" .. quote .. table.concat(candidates, ",") .. quote
     end)
     return body, assets
 end
@@ -993,12 +1160,20 @@ function Content.download_chapter_assets(client, book, chapter, used_names)
     elseif tar_url:match("^/") then
         tar_url = "https://weread.qq.com" .. tar_url
     end
-    local raw = client:get_binary(tar_url, { referer = referer })
+    tar_url = public_http_url(tar_url)
+    if not tar_url then error("unsafe chapter resource URL") end
+    local raw = client:get_binary(tar_url, {
+        referer = referer,
+        max_bytes = Content.MAX_CHAPTER_ARCHIVE_BYTES,
+    })
+    if type(raw) ~= "string" or #raw > Content.MAX_CHAPTER_ARCHIVE_BYTES then
+        error("chapter resource archive is too large")
+    end
     local assets = {}
     local src_map = {}
     for entry_index, entry in ipairs(tar_entries(raw)) do
-        local ext, media_type = media_type_for(entry.data)
-        if media_type:match("^image/") then
+        local data, ext, media_type = normalized_image_data(entry.data)
+        if data then
             local stem = basename(entry.name)
             local filename = unique_asset_name(used_names, stem, ext)
             local href = "images/" .. filename
@@ -1006,7 +1181,7 @@ function Content.download_chapter_assets(client, book, chapter, used_names)
             table.insert(assets, {
                 href = href,
                 media_type = media_type,
-                data = entry.data,
+                data = data,
             })
             src_map[stem] = epub_relative
             src_map[filename] = epub_relative
@@ -1015,7 +1190,6 @@ function Content.download_chapter_assets(client, book, chapter, used_names)
     return assets, src_map
 end
 
-local MAX_TAR_ENTRY_BYTES = 512 * 1024 * 1024
 local FILE_COPY_CHUNK_BYTES = 64 * 1024
 
 -- WeRead's catalog field is named `tar`, but cloud-converted documents may
@@ -1027,21 +1201,37 @@ local function extract_zip_images(archive_path, asset_dir, used_names)
     local archive = Archiver.Reader:new()
     local assets = {}
     local src_map = {}
+    local total_size = 0
+    local extracted_size = 0
+    local file_count = 0
     local ok, err = xpcall(function()
         if not archive:open(archive_path) then
             error(archive.err or "could not open chapter resource archive")
         end
         for entry in archive:iterate() do
-            if entry.mode == "file" and entry.size > 0 then
-                if entry.size > MAX_TAR_ENTRY_BYTES then
+            local entry_size = tonumber(entry.size) or 0
+            if entry.mode == "file" and entry_size > 0 then
+                file_count = file_count + 1
+                total_size = total_size + entry_size
+                if entry_size > Content.MAX_CHAPTER_IMAGE_BYTES
+                    or total_size > Content.MAX_CHAPTER_ASSET_BYTES
+                    or file_count > Content.MAX_CHAPTER_IMAGE_COUNT then
                     error("chapter resource archive entry is too large")
                 end
                 local data = archive:extractToMemory(entry.path)
                 if not data then
                     error(archive.err or "could not extract chapter resource")
                 end
-                local ext, media_type = media_type_for(data)
-                if media_type:match("^image/") then
+                if #data > Content.MAX_CHAPTER_IMAGE_BYTES then
+                    error("extracted chapter resource is too large")
+                end
+                extracted_size = extracted_size + #data
+                if extracted_size > Content.MAX_CHAPTER_ASSET_BYTES then
+                    error("extracted chapter resources exceed safe limits")
+                end
+                local normalized, ext, media_type = normalized_image_data(data)
+                if normalized then
+                    data = normalized
                     local stem = basename(entry.path)
                     local filename = unique_asset_name(used_names, stem, ext)
                     local href = "images/" .. filename
@@ -1074,6 +1264,8 @@ local function extract_tar_images(tar_path, asset_dir, used_names)
     if not input then error(open_err or "could not open chapter resource archive") end
     local assets = {}
     local src_map = {}
+    local total_size = 0
+    local file_count = 0
     local output
     local ok, err = xpcall(function()
         while true do
@@ -1084,13 +1276,21 @@ local function extract_tar_images(tar_path, asset_dir, used_names)
             local name = trim_nulls(header:sub(1, 100))
             local size_text = trim_nulls(header:sub(125, 136)):gsub("%s", "")
             local size = tonumber(size_text, 8)
-            if not size or size < 0 or size > MAX_TAR_ENTRY_BYTES then
+            if not size or size < 0 or size > Content.MAX_CHAPTER_IMAGE_BYTES then
                 error("invalid TAR entry size")
             end
             local typeflag = header:sub(157, 157)
             local is_file = name ~= "" and size > 0
                 and (typeflag == "0" or typeflag == "" or typeflag == "\0")
-            local first_size = math.min(size, 12)
+            if is_file then
+                file_count = file_count + 1
+                total_size = total_size + size
+                if total_size > Content.MAX_CHAPTER_ASSET_BYTES
+                    or file_count > Content.MAX_CHAPTER_IMAGE_COUNT then
+                    error("chapter resource archive exceeds safe limits")
+                end
+            end
+            local first_size = math.min(size, 512)
             local first = first_size > 0 and input:read(first_size) or ""
             if #first ~= first_size then error("truncated TAR entry") end
             local remaining = size - first_size
@@ -1113,18 +1313,22 @@ local function extract_tar_images(tar_path, asset_dir, used_names)
             if output then
                 output:close()
                 output = nil
-                local href = "images/" .. filename
-                table.insert(assets, {
-                    href = href,
-                    media_type = media_type,
-                    path = output_path,
-                    size = size,
-                    store = true,
-                })
-                local epub_relative = "../" .. href
-                local stem = basename(name)
-                src_map[stem] = epub_relative
-                src_map[filename] = epub_relative
+                if normalize_image_file(output_path, media_type) then
+                    local href = "images/" .. filename
+                    table.insert(assets, {
+                        href = href,
+                        media_type = media_type,
+                        path = output_path,
+                        size = size,
+                        store = true,
+                    })
+                    local epub_relative = "../" .. href
+                    local stem = basename(name)
+                    src_map[stem] = epub_relative
+                    src_map[filename] = epub_relative
+                else
+                    os.remove(output_path)
+                end
             end
             local padding = (512 - size % 512) % 512
             if padding > 0 then
@@ -1150,11 +1354,13 @@ function Content.download_chapter_assets_to_files(client, book, chapter, used_na
     elseif tar_url:match("^/") then
         tar_url = "https://weread.qq.com" .. tar_url
     end
+    tar_url = public_http_url(tar_url)
+    if not tar_url then error("unsafe chapter resource URL") end
     local tar_path = string.format("%s/chapter-%s.tar",
         workspace.incoming_dir, basename_safe(chapter.chapterUid or "unknown"))
     client:download_to_file(tar_url, tar_path, {
         referer = referer,
-        max_bytes = MAX_TAR_ENTRY_BYTES,
+        max_bytes = Content.MAX_CHAPTER_ARCHIVE_BYTES,
     })
     local input = assert(io.open(tar_path, "rb"))
     local signature = input:read(4) or ""
@@ -1174,37 +1380,44 @@ function Content.download_remote_images_to_files(client, xhtml, used_names, work
     used_names.__remote_image_hrefs = used_names.__remote_image_hrefs or {}
     local remote_image_hrefs = used_names.__remote_image_hrefs
     local function remote_url(src)
-        local url = tostring(src or "")
-        if url:match("^//") then url = "https:" .. url end
-        if url:match("^https?://") then return url end
+        return public_http_url(src)
     end
     local img_total = 0
     xhtml:gsub('src=(["\'])(.-)%1', function(_, src)
         if remote_url(src) then img_total = img_total + 1 end
     end)
+    xhtml:gsub('srcset=(["\'])(.-)%1', function(_, value)
+        if value:lower():find("data:", 1, true) then return end
+        for candidate in (value .. ","):gmatch("(.-),") do
+            local url = candidate:match("^%s*(%S+)")
+            if remote_url(url) then img_total = img_total + 1 end
+        end
+    end)
     local index = 0
-    local body = xhtml:gsub('src=(["\'])(.-)%1', function(quote, src)
-        local url = remote_url(src)
-        if not url then return "src=" .. quote .. src .. quote end
+    local function cache_remote(url)
         index = index + 1
         if progress then progress(index, img_total) end
         local cached_href = remote_image_hrefs[url]
-        if cached_href then return "src=" .. quote .. "../" .. cached_href .. quote end
+        if cached_href then return "../" .. cached_href end
         local incoming = string.format("%s/remote-%06d.bin", workspace.incoming_dir, index)
         local ok = pcall(function()
             client:download_to_file(url, incoming, {
                 referer = "https://weread.qq.com/",
-                max_bytes = 64 * 1024 * 1024,
+                max_bytes = Content.MAX_REMOTE_IMAGE_BYTES,
             })
         end)
         if not ok then
             pcall(os.remove, incoming)
-            return "src=" .. quote .. src .. quote
+            return nil
         end
         local ext, mt = media_type_for_file(incoming)
         if not mt or not mt:match("^image/") then
             pcall(os.remove, incoming)
-            return "src=" .. quote .. src .. quote
+            return nil
+        end
+        if not normalize_image_file(incoming, mt) then
+            pcall(os.remove, incoming)
+            return nil
         end
         local seed = basename((url:match("^[^%?#]+") or url))
         local fname = unique_asset_name(used_names,
@@ -1213,7 +1426,7 @@ function Content.download_remote_images_to_files(client, xhtml, used_names, work
         local renamed = os.rename(incoming, output_path)
         if not renamed then
             pcall(os.remove, incoming)
-            return "src=" .. quote .. src .. quote
+            return nil
         end
         local file = io.open(output_path, "rb")
         local size = file and file:seek("end") or 0
@@ -1227,7 +1440,30 @@ function Content.download_remote_images_to_files(client, xhtml, used_names, work
             size = size,
             store = true,
         })
-        return "src=" .. quote .. "../" .. href .. quote
+        return "../" .. href
+    end
+    local body = xhtml:gsub('src=(["\'])(.-)%1', function(quote, src)
+        local url = remote_url(src)
+        local href = url and cache_remote(url)
+        return "src=" .. quote .. (href or src) .. quote
+    end)
+    body = body:gsub('srcset=(["\'])(.-)%1', function(quote, value)
+        if value:lower():find("data:", 1, true) then
+            return "srcset=" .. quote .. value .. quote
+        end
+        local candidates = {}
+        for candidate in (value .. ","):gmatch("(.-),") do
+            local leading, source, descriptor = candidate:match("^(%s*)(%S+)(.*)$")
+            local url = source and remote_url(source)
+            local href = url and cache_remote(url)
+            if source then
+                candidates[#candidates + 1] = leading
+                    .. (href or source) .. descriptor
+            else
+                candidates[#candidates + 1] = candidate
+            end
+        end
+        return "srcset=" .. quote .. table.concat(candidates, ",") .. quote
     end)
     return body, assets
 end
@@ -1304,6 +1540,7 @@ function Content.fetch_chapter_shard(client, _settings, book, chapter, endpoint)
             ["Referer"] = chapter_url,
         },
         body = client:json_encode(params),
+        max_bytes = Content.MAX_CHAPTER_SHARD_BYTES,
     })
     if not code or code < 200 or code >= 300 then
         error(endpoint .. " failed: HTTP " .. tostring(code or "unknown"))
@@ -1372,6 +1609,19 @@ function Content.fetch_chapter_css(client, settings, book, chapter)
     return nil
 end
 
+local function remember_chapter_css(state, css)
+    state = state or {}
+    css = tostring(css or "")
+    if css == "" then return state.css end
+    state.chapter_css_seen = state.chapter_css_seen or {}
+    if state.chapter_css_seen[css] then return state.css end
+    state.css = tostring(state.css or "")
+    if state.css ~= "" then state.css = state.css .. "\n" end
+    state.css = state.css .. css
+    state.chapter_css_seen[css] = true
+    return state.css
+end
+
 
 local function apply_chapter_annotations(client, settings, book, chapter, xhtml, css)
     local cache = settings:get("cache", {})
@@ -1396,6 +1646,7 @@ function Content.fetch_chapter_epub(client, settings, book, chapter)
         local src_map
         assets, src_map = Content.download_chapter_assets(client, book, chapter, used_names)
         xhtml = Content.rewrite_image_sources(xhtml, src_map)
+        css = Content.rewrite_css_sources(css, src_map)
         local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, used_names)
         xhtml = inline_xhtml
         for _, a in ipairs(inline_assets) do
@@ -1415,9 +1666,8 @@ end
 function Content.fetch_single_chapter_content(client, settings, book, chapter, state)
     state = state or {}
     local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
-    if not state.css then
-        state.css = Content.fetch_chapter_css(client, settings, book, chapter)
-    end
+    remember_chapter_css(state,
+        Content.fetch_chapter_css(client, settings, book, chapter))
     xhtml, state.css = apply_chapter_annotations(client, settings, book, chapter, xhtml, state.css)
     local chapter_assets = {}
     local cache = settings:get("cache", {})
@@ -1428,6 +1678,7 @@ function Content.fetch_single_chapter_content(client, settings, book, chapter, s
             table.insert(chapter_assets, asset)
         end
         xhtml = Content.rewrite_image_sources(xhtml, src_map)
+        state.css = Content.rewrite_css_sources(state.css, src_map)
         local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, state.used_asset_names)
         xhtml = inline_xhtml
         for _, a in ipairs(inline_assets) do
@@ -1442,9 +1693,8 @@ end
 function Content.fetch_single_chapter_source(client, settings, book, chapter, state)
     state = state or {}
     local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
-    if not state.css then
-        state.css = Content.fetch_chapter_css(client, settings, book, chapter)
-    end
+    remember_chapter_css(state,
+        Content.fetch_chapter_css(client, settings, book, chapter))
     return xhtml
 end
 
@@ -1466,6 +1716,7 @@ function Content.finalize_single_chapter_content(client, settings, book, chapter
             table.insert(chapter_assets, asset)
         end
         xhtml = Content.rewrite_image_sources(xhtml, src_map)
+        state.css = Content.rewrite_css_sources(state.css, src_map)
         local inline_xhtml, inline_assets
         if state.workspace then
             inline_xhtml, inline_assets = Content.download_remote_images_to_files(
@@ -1489,16 +1740,16 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
     local assets = {}
     local used_asset_names = {}
     local cache = settings:get("cache", {})
-    local css
+    local css_state = {}
     for chapter_index, chapter in ipairs(chapters or {}) do
         if options.progress then
             options.progress(chapter_index, #chapters, chapter, "text")
         end
         local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
-        if not css then
-            css = Content.fetch_chapter_css(client, settings, book, chapter)
-        end
-        xhtml, css = apply_chapter_annotations(client, settings, book, chapter, xhtml, css)
+        remember_chapter_css(css_state,
+            Content.fetch_chapter_css(client, settings, book, chapter))
+        xhtml, css_state.css = apply_chapter_annotations(
+            client, settings, book, chapter, xhtml, css_state.css)
         if cache.download_book_images then
             if options.progress then
                 options.progress(chapter_index, #chapters, chapter, "images")
@@ -1508,6 +1759,7 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
                 table.insert(assets, asset)
             end
             xhtml = Content.rewrite_image_sources(xhtml, src_map)
+            css_state.css = Content.rewrite_css_sources(css_state.css, src_map)
             local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, used_asset_names)
             xhtml = inline_xhtml
             for _, a in ipairs(inline_assets) do
@@ -1521,7 +1773,8 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
     if #selected == 0 then
         error("No readable chapter found")
     end
-    local path = Content.save_book_epub(settings, book, selected, bodies, options.suffix or "book", assets, css)
+    local path = Content.save_book_epub(settings, book, selected, bodies,
+        options.suffix or "book", assets, css_state.css)
     book.cached_chapters = book.cached_chapters or {}
     for chapter_index, chapter in ipairs(selected) do
         book.cached_chapters[tostring(chapter.chapterUid or chapter_index)] = path
@@ -1593,7 +1846,7 @@ function Content.extract_mp_body(html)
     body = body:gsub(' src=""', '')
     body = body:gsub(" src=''", "")
     body = body:gsub("data%-src=", "src=")
-    return body
+    return BookLayout.sanitize_body(body)
 end
 
 local function normalize_void_elements(html)
@@ -1726,31 +1979,45 @@ function Content.download_mp_images(client, body_html, progress, embed_base64)
     local assets = {}
     local used_names = {}
     local img_total = 0
+    local function mp_image_url(src)
+        local url = public_http_url(src)
+        if not url then return nil end
+        local host = url:match("^https?://([^/%?#:]+)")
+        if host and (host:lower():match("%.qpic%.cn$")
+            or host:lower():match("%.qlogo%.cn$")) then
+            return url
+        end
+    end
     body_html:gsub('src=(["\'])(.-)%1', function(quote, src)
-        if src:match("mmbiz%.qpic%.cn") or src:match("mmbiz%.qlogo%.cn") then
+        if mp_image_url(src) then
             img_total = img_total + 1
         end
     end)
     local index = 0
     local body = body_html:gsub('src=(["\'])(.-)%1', function(quote, src)
-        if not src:match("mmbiz%.qpic%.cn") and not src:match("mmbiz%.qlogo%.cn") then
+        local url = mp_image_url(src)
+        if not url then
             return "src=" .. quote .. src .. quote
         end
         index = index + 1
         if progress then
             progress(index, img_total)
         end
-        local url = src
-        if url:match("^//") then
-            url = "https:" .. url
-        end
         local ok, data = pcall(function()
-            return client:get_binary(url, { referer = "https://weread.qq.com/" })
+            return client:get_binary(url, {
+                referer = "https://weread.qq.com/",
+                max_bytes = Content.MAX_REMOTE_IMAGE_BYTES,
+            })
         end)
-        if not ok or not data or #data == 0 then
+        if not ok or not data or #data == 0
+            or #data > Content.MAX_REMOTE_IMAGE_BYTES then
             return "src=" .. quote .. src .. quote
         end
-        local ext, mt = media_type_for(data)
+        local normalized, ext, mt = normalized_image_data(data)
+        if not normalized then
+            return "src=" .. quote .. src .. quote
+        end
+        data = normalized
         if embed_base64 then
             local b64 = base64_encode(data)
             return "src=" .. quote .. "data:" .. mt .. ";base64," .. b64 .. quote
@@ -1799,6 +2066,7 @@ function Content.save_mp_article_html(settings, book, article, body_html)
     os.execute("mkdir -p " .. string.format("%q", dir))
     local title = article.title or "Article"
     local path = Content.mp_article_path(settings, book, article)
+    body_html = BookLayout.sanitize_body(body_html)
     body_html = strip_mp_reader_font_styles(body_html)
     body_html = strip_blank_mp_blocks(body_html)
 

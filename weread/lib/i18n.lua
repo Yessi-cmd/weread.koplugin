@@ -1,6 +1,7 @@
 local I18n = {}
 
 local zh = {
+    ["weread-yessi"] = "weread-yessi",
     ["WeRead"] = "微信读书",
     ["WeRead · Sync reading progress"] = "微信读书·同步阅读进度",
     ["Bookshelf"] = "书架",
@@ -8,6 +9,9 @@ local zh = {
     ["WeRead favorites"] = "weread收藏夹",
     ["Search"] = "搜索",
     ["Settings"] = "设置",
+    ["Interface language"] = "界面语言",
+    ["Simplified Chinese"] = "简体中文",
+    ["English"] = "English",
     ["Update management"] = "更新管理",
     ["Update management · v%1 available"] = "更新管理 · v%1 可用",
     ["Update to v%1"] = "更新到 v%1",
@@ -15,16 +19,17 @@ local zh = {
     ["Check for updates"] = "检查更新",
     ["Automatically check once a day"] = "每天自动检查一次",
     ["Prefer proxy for updates"] = "更新时优先使用代理",
+    ["Private edition · Manual updates only"] = "私人版 · 仅支持手动更新",
     ["Update proxies are third-party services. They can see update requests and may be unavailable without notice. Release packages will still be verified before installation. Prefer proxies?"] = "更新代理由第三方提供，能够看到更新请求，也可能随时不可用。安装前仍会校验发布包。是否优先使用代理？",
     ["Enable"] = "启用",
     ["Checking for updates…"] = "正在检查更新……",
-    ["WeRead Plugin is up to date (v%1)."] = "微信读书插件已是最新版本（v%1）。",
+    ["weread-yessi Plugin is up to date (v%1)."] = "weread-yessi 插件已是最新版本（v%1）。",
     ["No release notes were provided."] = "本次发布未提供更新日志。",
     ["v%1 -> v%2"] = "v%1 -> v%2",
     ["Download and install"] = "下载并安装",
     ["Update check failed:\n%1"] = "检查更新失败：\n%1",
     ["Unknown error"] = "未知错误",
-    ["Preparing WeRead Plugin v%1…"] = "正在准备微信读书插件 v%1……",
+    ["Preparing weread-yessi Plugin v%1…"] = "正在准备 weread-yessi 插件 v%1……",
     ["Preparing update…"] = "正在准备更新……",
     ["Downloading update · %1%\n%2 / %3"] = "正在下载更新 · %1%\n%2 / %3",
     ["Downloading checksum…"] = "正在下载校验文件……",
@@ -33,7 +38,7 @@ local zh = {
     ["Installing update…"] = "正在安装更新……",
     ["Update installed."] = "更新安装完成。",
     ["Update installation failed:\n%1"] = "安装更新失败：\n%1",
-    ["WeRead Plugin v%1 was installed.\n\nRestart KOReader to apply the update?"] = "微信读书插件 v%1 已安装。\n\n是否重启 KOReader 以应用更新？",
+    ["weread-yessi Plugin v%1 was installed.\n\nRestart KOReader to apply the update?"] = "weread-yessi 插件 v%1 已安装。\n\n是否重启 KOReader 以应用更新？",
     ["Restart now"] = "立即重启",
     ["Later"] = "稍后",
     ["Sync progress now"] = "立即同步进度",
@@ -42,7 +47,7 @@ local zh = {
     ["Hide underlines and thoughts"] = "隐藏划线和想法",
     ["Underlines and thoughts shown"] = "已显示划线和想法",
     ["Underlines and thoughts hidden"] = "已隐藏划线和想法",
-    ["WeRead · Toggle underlines and thoughts"] = "微信读书·显示/隐藏划线和想法",
+    ["weread-yessi · Toggle underlines and thoughts"] = "weread-yessi · 显示/隐藏划线和想法",
     ["XPointer overlay prototype"] = "XPointer 标注层原型",
     ["Local-book underlines and thoughts"] = "本地书划线与想法",
     ["Match local book with WeRead"] = "将本地书匹配到微信读书",
@@ -100,6 +105,10 @@ local zh = {
     ["Renew cookie now"] = "立即续期 Cookie",
     ["Progress management"] = "进度管理",
     ["Pull progress on open"] = "打开时拉取进度",
+    ["Upload progress while reading"] = "阅读时定时上传进度",
+    ["Periodic upload disabled"] = "已关闭定时上传",
+    ["Every %1 minute(s)"] = "每 %1 分钟",
+    ["Off"] = "关闭",
     ["Upload progress on close"] = "关闭时上传进度",
     ["Reading progress sync"] = "阅读进度同步",
     ["Use WeRead progress"] = "使用微信读书进度",
@@ -117,7 +126,13 @@ local zh = {
     ["Cloud progress is in \"%1\", but this chapter has not been downloaded.\n\nDownload and open it now?"] = "云端进度位于《%1》，但该章节尚未下载。\n\n是否立即下载并打开？",
     ["Download target chapter"] = "下载目标章节",
     ["Download settings"] = "下载设置",
+    ["Book layout"] = "书籍排版",
+    ["Smart restoration"] = "智能还原",
+    ["Preserve original layout"] = "尽量保持原版",
+    ["Clean reading"] = "纯净阅读",
+    ["Layout changes apply to newly downloaded books."] = "排版设置会应用于之后重新下载的书籍。",
     ["Book images"] = "书籍图片",
+    ["Book images exceed the configured cache safety limit."] = "书籍图片超过了已配置的缓存安全上限。",
     ["Public account article images"] = "公众号文章图片",
     ["Prefetch underlines and thoughts"] = "预下载划线和想法",
     ["Chapter prefetch"] = "章节预下载",
@@ -405,11 +420,11 @@ local zh = {
     ["Auto-associate with WeRead book"] = "自动关联微信读书书籍",
     ["Manually set report book"] = "手动设置上报书籍",
     ["Current book is not from WeRead, reading time not reported"] = "当前书籍非微信读书书籍，不上报阅读时间",
-    ["WeRead · Quick menu"] = "微信读书·快捷菜单",
-    ["WeRead · Bookshelf"] = "微信读书·书架",
-    ["WeRead · Local bookshelf"] = "微信读书·本地书架",
-    ["WeRead · Reading statistics"] = "微信读书·阅读统计",
-    ["WeRead · Search"] = "微信读书·搜索",
+    ["weread-yessi · Quick menu"] = "weread-yessi · 快捷菜单",
+    ["weread-yessi · Bookshelf"] = "weread-yessi · 书架",
+    ["weread-yessi · Local bookshelf"] = "weread-yessi · 本地书架",
+    ["weread-yessi · Reading statistics"] = "weread-yessi · 阅读统计",
+    ["weread-yessi · Search"] = "weread-yessi · 搜索",
     ["Next chapter"] = "下一章",
     ["Close book"] = "关闭书籍",
     ["You have reached the last chapter."] = "已经是最后一章了。",
@@ -418,7 +433,7 @@ local zh = {
     ["Version %1"] = "版本 %1",
     ["Author: %1"] = "作者：%1",
     ["About (v%1)"] = "关于（v%1）",
-    ["WeRead Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\nhttps://github.com/finlater/weread.koplugin"] = "WeRead 插件 v%1\n\n免责声明：本项目仅供个人学习和技术研究使用，不得用于商业用途。使用本项目所产生的一切后果（包括但不限于账号封禁、数据丢失等）由使用者自行承担，项目作者概不负责。请遵守微信读书的用户协议和相关法律法规。\n\nhttps://github.com/finlater/weread.koplugin",
+    ["weread-yessi Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\nhttps://github.com/finlater/weread.koplugin"] = "weread-yessi 插件 v%1\n\n免责声明：本项目仅供个人学习和技术研究使用，不得用于商业用途。使用本项目所产生的一切后果（包括但不限于账号封禁、数据丢失等）由使用者自行承担，项目作者概不负责。请遵守微信读书的用户协议和相关法律法规。\n\nhttps://github.com/finlater/weread.koplugin",
     ["QR code login"] = "微信扫码登录",
     ["Unknown"] = "未知",
     -- Reading statistics
@@ -454,7 +469,24 @@ local zh = {
     ["%1 min"] = "%1 分钟",
 }
 
+local language_override
+
+function I18n.set_language(language)
+    language = tostring(language or "zh"):lower()
+    if language == "auto" then
+        language_override = nil
+    elseif language:match("^zh") then
+        language_override = "zh"
+    elseif language:match("^en") then
+        language_override = "en"
+    else
+        language_override = "zh"
+    end
+    return language_override or "auto"
+end
+
 function I18n.language()
+    if language_override then return language_override end
     local lang
     if G_reader_settings and G_reader_settings.readSetting then
         lang = G_reader_settings:readSetting("language")

@@ -12,6 +12,10 @@ function PluginUtil.tr(text)
     return I18n.tr(text)
 end
 
+function PluginUtil.set_language(language)
+    return I18n.set_language(language)
+end
+
 function PluginUtil.log_error(err)
     local text = tostring(err):gsub("[%c]+", " ")
     if #text > 500 then

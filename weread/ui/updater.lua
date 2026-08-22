@@ -119,7 +119,7 @@ function UpdaterUI:_show_release(release)
     if self.updater.compare_versions(
         release.version, self.updater.current_version) ~= 1 then
         UIManager:show(InfoMessage:new{
-            text = T(_("WeRead Plugin is up to date (v%1)."),
+            text = T(_("weread-yessi Plugin is up to date (v%1)."),
                 self.updater.current_version),
             timeout = 3,
         })
@@ -219,7 +219,7 @@ function UpdaterUI:install(release)
     remove_file(progress_path)
     remove_file(progress_path .. ".tmp")
     local dialog = DownloadDialog:new{
-        title = T(_("Preparing WeRead Plugin v%1…"), release.version),
+        title = T(_("Preparing weread-yessi Plugin v%1…"), release.version),
         progress_max = 100,
         refresh_time_seconds = 1,
         dismissable = false,
@@ -270,7 +270,7 @@ function UpdaterUI:install(release)
         self.refresh_ui()
         UIManager:show(ConfirmBox:new{
             text = T(
-                _("WeRead Plugin v%1 was installed.\n\nRestart KOReader to apply the update?"),
+                _("weread-yessi Plugin v%1 was installed.\n\nRestart KOReader to apply the update?"),
                 release.version),
             ok_text = _("Restart now"),
             cancel_text = _("Later"),

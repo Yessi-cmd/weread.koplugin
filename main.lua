@@ -8,6 +8,7 @@ local Content = require("weread.lib.content")
 local Downloader = require("weread.lib.downloader")
 local ExternalAnnotationsDB = require("weread.lib.external_annotations_db")
 local Integrations = require("integrations.init")
+local I18n = require("weread.lib.i18n")
 local LibraryDB = require("weread.lib.library_db")
 local Mixin = require("weread.lib.mixin")
 local Migrations = require("weread.lib.migrations")
@@ -26,6 +27,9 @@ local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
     version = "1.2.0",
+    -- This customized build must never install the public upstream release over
+    -- itself. Future private updates are installed manually from a verified ZIP.
+    private_build = true,
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -46,6 +50,7 @@ end
 function WeReadPlugin:init()
     math.randomseed(os.time())
     self.settings = Settings:new()
+    I18n.set_language(self.settings:get("language", "zh"))
     self.external_annotations_db = ExternalAnnotationsDB:new(self.settings)
     self.library_db = LibraryDB:new(self.settings)
     local updater = Updater:new{
@@ -190,6 +195,12 @@ function WeReadPlugin:init()
         is_online = function()
             return self:isNetworkConnected()
         end,
+        is_time_reporting = function(book_id)
+            if not self.read_report then return false end
+            local status = self.read_report:status()
+            return status.running
+                and tostring(status.target_book_id or "") == tostring(book_id)
+        end,
         on_choice = function(context)
             ProgressSyncDialog.show_choice(context)
         end,
@@ -209,7 +220,9 @@ function WeReadPlugin:init()
         self.read_report:maybe_start("plugin_start")
     end
     self._reader_session_gen = 0
-    self.updater:schedule_auto_check()
+    if not self.private_build then
+        self.updater:schedule_auto_check()
+    end
     logger.info("initialized:", "version=", self.version)
     updater:cleanup_backup()
 end

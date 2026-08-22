@@ -222,35 +222,35 @@ function M:remapCachedPath(path, dst)
 end
 
 local SHELF_SORT_OPTIONS = {
-    { key = "time_desc", label = _("Last read time (newest first)"), short = _("Newest") },
-    { key = "time_asc",  label = _("Last read time (oldest first)"), short = _("Oldest") },
-    { key = "default",   label = _("Default order"), short = _("Default") },
-    { key = "name_asc",  label = _("Title A-Z"), short = "A–Z" },
-    { key = "name_desc", label = _("Title Z-A"), short = "Z–A" },
+    { key = "time_desc", label = "Last read time (newest first)", short = "Newest" },
+    { key = "time_asc",  label = "Last read time (oldest first)", short = "Oldest" },
+    { key = "default",   label = "Default order", short = "Default" },
+    { key = "name_asc",  label = "Title A-Z", short = "A–Z" },
+    { key = "name_desc", label = "Title Z-A", short = "Z–A" },
 }
 
 local function shelfSortLabel(sort_key)
     for _i, opt in ipairs(SHELF_SORT_OPTIONS) do
         if opt.key == sort_key then
-            return opt.label
+            return _(opt.label)
         end
     end
-    return SHELF_SORT_OPTIONS[1].label
+    return _(SHELF_SORT_OPTIONS[1].label)
 end
 
 function M:shelfSortSummary()
     local sort_key = self.settings:get("shelf").sort_order
     for _i, opt in ipairs(SHELF_SORT_OPTIONS) do
-        if opt.key == sort_key then return opt.short end
+        if opt.key == sort_key then return _(opt.short) end
     end
-    return SHELF_SORT_OPTIONS[1].short
+    return _(SHELF_SORT_OPTIONS[1].short)
 end
 
 local SHELF_FILTER_OPTIONS = {
-    { dim = "reading",  value = "finished",       label = _("Only show finished books"),       short = _("Finished") },
-    { dim = "reading",  value = "unfinished",     label = _("Only show unfinished books"),     short = _("Unfinished") },
-    { dim = "download", value = "downloaded",     label = _("Only show downloaded books"),     short = _("Downloaded") },
-    { dim = "download", value = "not_downloaded", label = _("Only show not-downloaded books"), short = _("Not downloaded") },
+    { dim = "reading",  value = "finished",       label = "Only show finished books",       short = "Finished" },
+    { dim = "reading",  value = "unfinished",     label = "Only show unfinished books",     short = "Unfinished" },
+    { dim = "download", value = "downloaded",     label = "Only show downloaded books",     short = "Downloaded" },
+    { dim = "download", value = "not_downloaded", label = "Only show not-downloaded books", short = "Not downloaded" },
 }
 
 function M:shelfFilterSummary()
@@ -258,7 +258,7 @@ function M:shelfFilterSummary()
     local parts = {}
     for _i, opt in ipairs(SHELF_FILTER_OPTIONS) do
         if filters[opt.dim] == opt.value then
-            table.insert(parts, opt.short)
+            table.insert(parts, _(opt.short))
         end
     end
     if #parts == 0 then
@@ -294,7 +294,7 @@ function M:showShelfSortOptions(on_sorted)
     for _i, opt in ipairs(SHELF_SORT_OPTIONS) do
         table.insert(buttons, {
             {
-                text = opt.label,
+                text = _(opt.label),
                 checked_func = function()
                     return opt.key == current_sort
                 end,
@@ -346,7 +346,7 @@ function M:showShelfFilterOptions(on_changed)
     for _i, opt in ipairs(SHELF_FILTER_OPTIONS) do
         table.insert(buttons, {
             {
-                text = opt.label,
+                text = _(opt.label),
                 checked_func = function()
                     return filters[opt.dim] == opt.value
                 end,

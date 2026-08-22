@@ -15,6 +15,12 @@ local values = {
     account = { name = "legacy-user" },
     books = { ["42"] = { cache_dir = "/cache/42" } },
     cache = { download_images = false },
+    sync = {
+        pull_on_open = true,
+        upload_on_close = true,
+        ask_on_conflict = false,
+        upload_interval_minutes = 0,
+    },
     config_loaded = true,
 }
 local flush_count = 0
@@ -93,6 +99,20 @@ expect(settings:get("shelf").paginated == true,
     "bookshelf pagination should be enabled by default")
 expect(settings:get("shelf").view_mode == "list",
     "bookshelf should default to the low-overhead list view")
+expect(settings:get("language") == "zh",
+    "plugin interface should default to Simplified Chinese")
+expect(values.sync.upload_interval_minutes == 1
+        and values.sync_schema_version == Settings.SYNC_SCHEMA_VERSION,
+    "legacy progress settings did not enable the throttled heartbeat")
+expect(values.sync.pull_on_open == true
+        and values.sync.upload_on_close == true
+        and values.sync.ask_on_conflict == false,
+    "progress settings migration did not preserve existing preferences")
+expect(values.read_report.enabled == true
+        and values.read_report.mode == "auto"
+        and values.read_report.report_on_open == true
+        and values.read_report_schema_version == Settings.READ_REPORT_SCHEMA_VERSION,
+    "daily reading-time reporting was not enabled in safe automatic mode")
 expect(created_dirs[1] == "/data/weread"
     and created_dirs[2] == "/data/weread/cache",
     "settings directories were not initialized")
@@ -105,14 +125,17 @@ expect(values.books["42"].cache_dir == "/cache/42",
     "authentication migration changed the book index")
 expect(values.config_loaded == nil, "legacy setting was not removed")
 expect(values.cache.download_book_images == false
+    and values.cache.book_layout_mode == "smart"
     and values.cache.download_mp_images == false
     and values.cache.auto_prefetch_next_chapter == false
     and values.cache.show_prefetch_notifications == true
     and values.cache.show_annotations == true
     and values.cache.download_images == nil,
     "legacy cache preferences were not migrated")
-expect(flush_count == 2,
-    "cache and authentication migrations should each flush once")
+expect(values.cache.max_size_mb == 1024,
+    "missing cache safety defaults were not restored")
+expect(flush_count == 4,
+    "cache, progress, reading-time, and authentication migrations should each flush once")
 
 local books = settings:get("books")
 expect(books["42"].loaded and books["42"].book_id == "42",
@@ -155,5 +178,17 @@ settings:reset_account()
 expect(values.api_key == "" and next(values.cookies) == nil
     and values.account.name == "",
     "account reset left credentials behind")
+
+values.cache = "corrupted"
+values.sync = "corrupted"
+values.sync_schema_version = Settings.SYNC_SCHEMA_VERSION
+local recovered = Settings:new()
+expect(type(recovered:get("cache")) == "table"
+        and recovered:get("cache").book_layout_mode == "smart"
+        and recovered:get("cache").edge_tap_ratio == 0.20,
+    "corrupted cache preferences were not recovered")
+expect(type(recovered:get("sync")) == "table"
+        and recovered:get("sync").upload_interval_minutes == 1,
+    "corrupted progress preferences were not recovered")
 
 print(("settings_spec: %d checks"):format(checks))
