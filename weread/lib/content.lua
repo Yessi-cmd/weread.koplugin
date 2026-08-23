@@ -867,7 +867,8 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     return path
 end
 
-function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css, cover_data)
+function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix,
+        assets, css, cover_data, chapter_css_by_uid)
     local book_id = book.book_id or book.bookId
     local dir = Content.book_resolved_dir(settings, book_id, book)
     os.execute("mkdir -p " .. string.format("%q", dir))
@@ -925,6 +926,25 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
         local filename = string.format("text/chapter-%03d.xhtml", chapter_index)
         local id = item_id("chapter_", uid)
         local title = chapter.title or ("Chapter " .. uid)
+        local chapter_style_link = ""
+        local chapter_css = type(chapter_css_by_uid) == "table"
+            and tostring(chapter_css_by_uid[uid] or "") or ""
+        if chapter_css ~= "" then
+            local style_id = "chapter_style_" .. tostring(chapter_index)
+            local style_href = string.format(
+                "chapter-%03d.css", chapter_index)
+            table.insert(manifest_items,
+                '<item id="' .. style_id .. '" href="' .. style_href
+                    .. '" media-type="text/css"/>')
+            table.insert(entries, {
+                name = "OEBPS/" .. style_href,
+                data = BookLayout.sanitize_css(chapter_css),
+            })
+            -- Keep the original chapter stylesheet before the shared sheet so
+            -- generated layout, annotations and footnotes retain final say.
+            chapter_style_link = '<link rel="stylesheet" type="text/css" href="../'
+                .. style_href .. '"/>\n'
+        end
         local chapter_body, chapter_kind = BookLayout.prepare_body(
             body_fragment(chapter_bodies[uid] or ""), chapter, layout_mode)
         local body_classes = BookLayout.body_classes(
@@ -934,7 +954,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="zh-CN">
 <head>
 <title>]] .. xml_escape(title) .. [[</title>
-<link rel="stylesheet" type="text/css" href="../style.css"/>
+]] .. chapter_style_link .. [[<link rel="stylesheet" type="text/css" href="../style.css"/>
 </head>
 <body class="]] .. body_classes .. [[">
 ]] .. chapter_body .. [[
@@ -1609,17 +1629,29 @@ function Content.fetch_chapter_css(client, settings, book, chapter)
     return nil
 end
 
-local function remember_chapter_css(state, css)
+local function chapter_css_key(chapter)
+    return tostring(chapter and (chapter.chapterUid or chapter.chapterId) or "")
+end
+
+local function remember_chapter_css(state, chapter, css)
     state = state or {}
     css = tostring(css or "")
-    if css == "" then return state.css end
-    state.chapter_css_seen = state.chapter_css_seen or {}
-    if state.chapter_css_seen[css] then return state.css end
-    state.css = tostring(state.css or "")
-    if state.css ~= "" then state.css = state.css .. "\n" end
-    state.css = state.css .. css
-    state.chapter_css_seen[css] = true
-    return state.css
+    local uid = chapter_css_key(chapter)
+    if uid == "" then return css end
+    state.chapter_css = state.chapter_css or {}
+    state.chapter_css[uid] = css
+    return css
+end
+
+function Content.css_for_chapter(state, chapter)
+    state = state or {}
+    local uid = chapter_css_key(chapter)
+    local chapter_css = type(state.chapter_css) == "table"
+        and tostring(state.chapter_css[uid] or "") or ""
+    local shared_css = tostring(state.css or "")
+    if chapter_css == "" then return shared_css end
+    if shared_css == "" then return chapter_css end
+    return chapter_css .. "\n" .. shared_css
 end
 
 
@@ -1666,9 +1698,11 @@ end
 function Content.fetch_single_chapter_content(client, settings, book, chapter, state)
     state = state or {}
     local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
-    remember_chapter_css(state,
-        Content.fetch_chapter_css(client, settings, book, chapter))
-    xhtml, state.css = apply_chapter_annotations(client, settings, book, chapter, xhtml, state.css)
+    local chapter_css = Content.fetch_chapter_css(
+        client, settings, book, chapter)
+    xhtml, chapter_css = apply_chapter_annotations(
+        client, settings, book, chapter, xhtml, chapter_css)
+    remember_chapter_css(state, chapter, chapter_css)
     local chapter_assets = {}
     local cache = settings:get("cache", {})
     if cache.download_book_images then
@@ -1678,7 +1712,9 @@ function Content.fetch_single_chapter_content(client, settings, book, chapter, s
             table.insert(chapter_assets, asset)
         end
         xhtml = Content.rewrite_image_sources(xhtml, src_map)
-        state.css = Content.rewrite_css_sources(state.css, src_map)
+        local uid = chapter_css_key(chapter)
+        state.chapter_css[uid] = Content.rewrite_css_sources(
+            state.chapter_css[uid], src_map)
         local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, state.used_asset_names)
         xhtml = inline_xhtml
         for _, a in ipairs(inline_assets) do
@@ -1693,7 +1729,7 @@ end
 function Content.fetch_single_chapter_source(client, settings, book, chapter, state)
     state = state or {}
     local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
-    remember_chapter_css(state,
+    remember_chapter_css(state, chapter,
         Content.fetch_chapter_css(client, settings, book, chapter))
     return xhtml
 end
@@ -1716,7 +1752,11 @@ function Content.finalize_single_chapter_content(client, settings, book, chapter
             table.insert(chapter_assets, asset)
         end
         xhtml = Content.rewrite_image_sources(xhtml, src_map)
-        state.css = Content.rewrite_css_sources(state.css, src_map)
+        local uid = chapter_css_key(chapter)
+        if type(state.chapter_css) == "table" then
+            state.chapter_css[uid] = Content.rewrite_css_sources(
+                state.chapter_css[uid], src_map)
+        end
         local inline_xhtml, inline_assets
         if state.workspace then
             inline_xhtml, inline_assets = Content.download_remote_images_to_files(
@@ -1740,16 +1780,16 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
     local assets = {}
     local used_asset_names = {}
     local cache = settings:get("cache", {})
-    local css_state = {}
+    local chapter_styles = {}
     for chapter_index, chapter in ipairs(chapters or {}) do
         if options.progress then
             options.progress(chapter_index, #chapters, chapter, "text")
         end
         local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
-        remember_chapter_css(css_state,
-            Content.fetch_chapter_css(client, settings, book, chapter))
-        xhtml, css_state.css = apply_chapter_annotations(
-            client, settings, book, chapter, xhtml, css_state.css)
+        local chapter_css = Content.fetch_chapter_css(
+            client, settings, book, chapter)
+        xhtml, chapter_css = apply_chapter_annotations(
+            client, settings, book, chapter, xhtml, chapter_css)
         if cache.download_book_images then
             if options.progress then
                 options.progress(chapter_index, #chapters, chapter, "images")
@@ -1759,7 +1799,7 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
                 table.insert(assets, asset)
             end
             xhtml = Content.rewrite_image_sources(xhtml, src_map)
-            css_state.css = Content.rewrite_css_sources(css_state.css, src_map)
+            chapter_css = Content.rewrite_css_sources(chapter_css, src_map)
             local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, used_asset_names)
             xhtml = inline_xhtml
             for _, a in ipairs(inline_assets) do
@@ -1769,12 +1809,13 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
         local uid = tostring(chapter.chapterUid or chapter_index)
         table.insert(selected, chapter)
         bodies[uid] = xhtml
+        chapter_styles[uid] = chapter_css
     end
     if #selected == 0 then
         error("No readable chapter found")
     end
     local path = Content.save_book_epub(settings, book, selected, bodies,
-        options.suffix or "book", assets, css_state.css)
+        options.suffix or "book", assets, nil, nil, chapter_styles)
     book.cached_chapters = book.cached_chapters or {}
     for chapter_index, chapter in ipairs(selected) do
         book.cached_chapters[tostring(chapter.chapterUid or chapter_index)] = path

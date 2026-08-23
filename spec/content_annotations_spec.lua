@@ -162,12 +162,39 @@ local css_state = {}
 Content.fetch_single_chapter_source({}, {}, {}, { chapterUid = 1 }, css_state)
 Content.fetch_single_chapter_source({}, {}, {}, { chapterUid = 2 }, css_state)
 Content.fetch_single_chapter_source({}, {}, {}, { chapterUid = 1 }, css_state)
-expect(css_state.css:find(".chapter%-1{}")
-        and css_state.css:find(".chapter%-2{}")
-        and select(2, css_state.css:gsub("%.chapter%-1{}", "")) == 1,
-    "distinct per-chapter styles were not merged and deduplicated")
+expect(css_state.chapter_css["1"] == ".chapter-1{}"
+        and css_state.chapter_css["2"] == ".chapter-2{}",
+    "chapter styles were not kept in separate slots")
 Content.fetch_chapter_xhtml = original_fetch_xhtml
 Content.fetch_chapter_css = original_fetch_css
+
+local original_download_assets = Content.download_chapter_assets
+Content.download_chapter_assets = function(_client, _book, chapter)
+    local suffix = tostring(chapter.chapterUid) == "1" and "" or "-2"
+    return {}, { ["image.png"] = "../images/image" .. suffix .. ".png" }
+end
+local isolated_css_state = {
+    chapter_css = {
+        ["1"] = ".first{background:url(image.png)}",
+        ["2"] = ".second{background:url(image.png)}",
+    },
+}
+local image_settings = {
+    get = function()
+        return { download_book_images = true }
+    end,
+}
+Content.finalize_single_chapter_content(
+    {}, image_settings, {}, { chapterUid = 1 }, "<p>one</p>", isolated_css_state)
+Content.finalize_single_chapter_content(
+    {}, image_settings, {}, { chapterUid = 2 }, "<p>two</p>", isolated_css_state)
+expect(isolated_css_state.chapter_css["1"]:find(
+        "url(images/image.png)", 1, true)
+        and not isolated_css_state.chapter_css["1"]:find("image-2", 1, true)
+        and isolated_css_state.chapter_css["2"]:find(
+            "url(images/image-2.png)", 1, true),
+    "a later chapter remapped an earlier chapter's same-named CSS image")
+Content.download_chapter_assets = original_download_assets
 
 local body = Content.extract_mp_body(
     '<div id="js_content"><p data-src="x.jpg">article</p>'

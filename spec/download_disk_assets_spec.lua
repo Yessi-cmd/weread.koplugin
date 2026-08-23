@@ -64,7 +64,7 @@ package.preload["ffi/archiver"] = function()
     end
     function Writer:addFileFromMemory(name, data)
         archive_calls[#archive_calls + 1] = {
-            kind = "memory", name = name, bytes = #data,
+            kind = "memory", name = name, bytes = #data, data = data,
         }
         return true
     end
@@ -215,6 +215,39 @@ expect(used_path and path_calls == 1,
     "EPUB writer did not stream the staged image directory with one addPath")
 expect(io.open(output .. ".part", "rb") == nil,
     "successful EPUB build left a partial archive")
+
+Content.save_book_epub(settings, book, {
+    { chapterUid = 1, title = "One" },
+    { chapterUid = 2, title = "Two" },
+}, {
+    ["1"] = "<p>one</p>",
+    ["2"] = "<p>two</p>",
+}, "book", {}, ".shared{}", nil, {
+    ["1"] = ".one{background:url(images/image.png)}",
+    ["2"] = ".two{background:url(images/image-2.png)}",
+})
+local chapter_css_files = {}
+local chapter_links = {}
+for _, call in ipairs(archive_calls) do
+    if call.kind == "memory" and call.name:match("OEBPS/chapter%-%d+%.css$") then
+        chapter_css_files[call.name] = call.data
+    elseif call.kind == "memory"
+        and call.name:match("OEBPS/text/chapter%-%d+%.xhtml$") then
+        chapter_links[call.name] = call.data
+    end
+end
+expect(chapter_css_files["OEBPS/chapter-001.css"]:find(
+        "images/image.png", 1, true)
+        and not chapter_css_files["OEBPS/chapter-001.css"]:find(
+            "image-2.png", 1, true)
+        and chapter_css_files["OEBPS/chapter-002.css"]:find(
+            "images/image-2.png", 1, true),
+    "same-named CSS resources were not isolated by chapter")
+expect(chapter_links["OEBPS/text/chapter-001.xhtml"]:find(
+        'href="../chapter-001.css"', 1, true)
+        and chapter_links["OEBPS/text/chapter-002.xhtml"]:find(
+            'href="../chapter-002.css"', 1, true),
+    "chapter XHTML did not link its own stylesheet")
 
 local old = assert(io.open(output, "wb"))
 old:write("known-good-old-epub")

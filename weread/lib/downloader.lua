@@ -29,6 +29,13 @@ local function _(text)
     return I18n.tr(text)
 end
 
+local function css_for_chapter(state, chapter)
+    if type(Content.css_for_chapter) == "function" then
+        return Content.css_for_chapter(state, chapter)
+    end
+    return tostring(state and state.css or "")
+end
+
 local function log_error(err)
     local text = tostring(err):gsub("[%c]+", " ")
     if #text > 500 then
@@ -871,7 +878,7 @@ function Downloader:_step(dl)
                 return Content.save_chapter_epub(
                     self.settings, dl.book, chapter, dl.bodies[uid],
                     (dl.assets_by_uid and dl.assets_by_uid[uid]) or dl.assets,
-                    dl.state.css
+                    css_for_chapter(dl.state, chapter)
                 )
             end
             if dl.separate_chapters then
@@ -881,7 +888,7 @@ function Downloader:_step(dl)
                     paths[uid] = Content.save_chapter_epub(
                         self.settings, dl.book, chapter, dl.bodies[uid],
                         (dl.assets_by_uid and dl.assets_by_uid[uid]) or {},
-                        dl.state.css
+                        css_for_chapter(dl.state, chapter)
                     )
                 end
                 return paths[tostring(dl.selected[1].chapterUid or 1)], paths
@@ -897,7 +904,8 @@ function Downloader:_step(dl)
             end
             return Content.save_book_epub(
                 self.settings, dl.book, dl.selected, dl.bodies,
-                dl.suffix, dl.assets, dl.state.css, cover_data
+                dl.suffix, dl.assets, dl.state.css, cover_data,
+                dl.state.chapter_css
             )
         end)
         self:_cleanupWorkspace(dl)
