@@ -249,6 +249,30 @@ expect(chapter_links["OEBPS/text/chapter-001.xhtml"]:find(
             'href="../chapter-002.css"', 1, true),
     "chapter XHTML did not link its own stylesheet")
 
+Content.save_book_epub(settings, book, {
+    { chapterUid = 1, chapterIdx = 1, title = "" },
+    { chapterUid = 2, chapterIdx = 2, title = "" },
+}, {
+    ["1"] = "<p>one</p>",
+    ["2"] = "<p>two</p>",
+}, "untitled", {}, "")
+local inferred_nav
+local inferred_second_chapter
+for _, call in ipairs(archive_calls) do
+    if call.kind == "memory" and call.name == "OEBPS/nav.xhtml" then
+        inferred_nav = call.data
+    elseif call.kind == "memory"
+        and call.name == "OEBPS/text/chapter-002.xhtml" then
+        inferred_second_chapter = call.data
+    end
+end
+expect(inferred_nav and inferred_nav:find("第2章", 1, true)
+        and inferred_second_chapter
+        and inferred_second_chapter:find(
+            '<header class="wr-generated-chapter-heading"><h1>第2章</h1>',
+            1, true),
+    "inferred chapter title was not written to EPUB navigation and body")
+
 local old = assert(io.open(output, "wb"))
 old:write("known-good-old-epub")
 old:close()

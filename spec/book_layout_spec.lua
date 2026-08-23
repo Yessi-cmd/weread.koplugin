@@ -80,6 +80,33 @@ expect(BookLayout.body_classes("clean", "illustrated", "text")
 expect(BookLayout.compose_css(nil, "clean"):find("text-align: justify", 1, true),
     "clean mode did not add normalized reading styles")
 
+local untitled_catalog = {}
+for index = 1, 11 do
+    untitled_catalog[index] = {
+        chapterUid = index, chapterIdx = index, title = "", wordCount = 1000,
+    }
+end
+untitled_catalog[12] = {
+    chapterUid = 12, chapterIdx = 12, title = "译后记", wordCount = 500,
+}
+local inferred_catalog = BookLayout.prepare_chapters(untitled_catalog, "smart")
+expect(inferred_catalog[10].title == "第10章"
+        and inferred_catalog[10]._wr_inferred_title == true
+        and inferred_catalog[12].title == "译后记",
+    "mostly untitled catalog did not infer numbered chapter titles")
+expect(untitled_catalog[10].title == "",
+    "title inference mutated the source catalog")
+local mostly_named = BookLayout.prepare_chapters({
+    { chapterUid = 1, title = "第一部分" },
+    { chapterUid = 2, title = "" },
+    { chapterUid = 3, title = "第三部分" },
+}, "smart")
+expect(mostly_named[2].title == "",
+    "isolated blank title in a named catalog was assigned a number")
+local original_catalog = BookLayout.prepare_chapters(untitled_catalog, "original")
+expect(original_catalog[10].title == "",
+    "original mode inferred a missing catalog title")
+
 local sanitized = BookLayout.sanitize_body(
     '<SCRIPT>alert(1)</SCRIPT><p onclick="bad()">safe\0text'
         .. '<a href="javascript:bad()">link</a><a href=file:///etc/passwd>x</a></p>'

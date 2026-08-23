@@ -795,13 +795,17 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     local dir = Content.book_resolved_dir(settings, book_id, book)
     os.execute("mkdir -p " .. string.format("%q", dir))
     book.cache_dir = dir
-    local book_title = book.title or "WeRead"
-    local path = dir .. "/" .. filename_safe(book_title .. " - " .. (chapter.title or tostring(chapter.chapterUid or "chapter"))) .. ".epub"
-    local title = chapter.title or book.title or "WeRead"
-    local author = book.author or "WeRead"
     local layout_mode = BookLayout.mode(settings)
+    local layout_chapter = BookLayout.prepare_chapter(
+        chapter, book.chapters or { chapter }, layout_mode)
+    local book_title = book.title or "WeRead"
+    local path = dir .. "/" .. filename_safe(book_title .. " - "
+        .. (layout_chapter.title
+            or tostring(chapter.chapterUid or "chapter"))) .. ".epub"
+    local title = layout_chapter.title or book.title or "WeRead"
+    local author = book.author or "WeRead"
     local chapter_body, chapter_kind = BookLayout.prepare_body(
-        body_fragment(xhtml), chapter, layout_mode)
+        body_fragment(xhtml), layout_chapter, layout_mode)
     local book_kind = chapter_kind
     local body_classes = BookLayout.body_classes(
         layout_mode, book_kind, chapter_kind)
@@ -877,10 +881,11 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (suffix or "book")) .. ".epub"
     local author = book.author or "WeRead"
     local layout_mode = BookLayout.mode(settings)
-    local book_kind = BookLayout.classify_book(chapters, chapter_bodies)
+    local layout_chapters = BookLayout.prepare_chapters(chapters, layout_mode)
+    local book_kind = BookLayout.classify_book(layout_chapters, chapter_bodies)
     logger.info("book layout prepared:",
         "mode=", layout_mode, "kind=", book_kind,
-        "chapters=", tostring(#(chapters or {})))
+        "chapters=", tostring(#layout_chapters))
     local manifest_items = {
         [[<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>]],
         [[<item id="toc" href="toc.ncx" media-type="application/x-dtbncx+xml"/>]],
@@ -921,7 +926,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
     end
     append_asset_entries(entries, assets)
 
-    for chapter_index, chapter in ipairs(chapters or {}) do
+    for chapter_index, chapter in ipairs(layout_chapters) do
         local uid = tostring(chapter.chapterUid or chapter_index)
         local filename = string.format("text/chapter-%03d.xhtml", chapter_index)
         local id = item_id("chapter_", uid)
@@ -983,7 +988,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 ]] .. table.concat(spine_items, "\n") .. [[
 </spine>
 </package>]]
-    local ncx_points = build_ncx_points(chapters, function(chapter_index)
+    local ncx_points = build_ncx_points(layout_chapters, function(chapter_index)
         return string.format("text/chapter-%03d.xhtml", chapter_index)
     end)
     local ncx = [[<?xml version="1.0" encoding="utf-8"?>
@@ -1005,7 +1010,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 <body>
 <nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops">
 <ol>
-]] .. build_nav_items(chapters, function(chapter_index)
+]] .. build_nav_items(layout_chapters, function(chapter_index)
         return string.format("text/chapter-%03d.xhtml", chapter_index)
     end) .. [[
 </ol>

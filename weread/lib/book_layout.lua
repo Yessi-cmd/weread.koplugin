@@ -195,6 +195,72 @@ function BookLayout.mode(settings)
     return BookLayout.normalize_mode(cache and cache.book_layout_mode)
 end
 
+local function catalog_title(chapter)
+    local title = tostring(chapter and chapter.title or "")
+    return title:match("^%s*(.-)%s*$") or ""
+end
+
+local function chapter_ordinal(chapter, position, total)
+    local uid = tonumber(chapter and (chapter.chapterUid or chapter.chapterId))
+    if uid and uid == position and uid == math.floor(uid) then
+        return uid
+    end
+    local value = tonumber(chapter and chapter.chapterIdx)
+    if not value or value < 1 or value ~= math.floor(value) then
+        value = tonumber(chapter and (chapter.chapterUid or chapter.chapterId))
+    end
+    -- WeRead chapter UIDs are sometimes large opaque numbers. Only use a UID
+    -- that plausibly represents an ordinal; otherwise use the catalog position.
+    if not value or value < 1 or value ~= math.floor(value)
+        or value > math.max(20, (tonumber(total) or 0) * 4) then
+        value = position
+    end
+    return math.floor(value)
+end
+
+function BookLayout.prepare_chapters(chapters, mode)
+    mode = BookLayout.normalize_mode(mode)
+    chapters = type(chapters) == "table" and chapters or {}
+    local untitled = 0
+    for _index, chapter in ipairs(chapters) do
+        if catalog_title(chapter) == "" then untitled = untitled + 1 end
+    end
+    -- Some WeRead EPUB catalogs omit every numbered chapter title and leave
+    -- the App to render "第N章" from its index. Infer that convention only when
+    -- blank titles dominate the catalog, so an isolated malformed chapter in
+    -- an otherwise named book is not assigned a misleading number.
+    local infer_numbered_titles = mode ~= BookLayout.MODE_ORIGINAL
+        and untitled >= 2 and untitled * 2 >= #chapters
+    local prepared = {}
+    for index, chapter in ipairs(chapters) do
+        local copy = {}
+        for key, value in pairs(chapter) do copy[key] = value end
+        if infer_numbered_titles and catalog_title(copy) == "" then
+            copy.title = "第" .. tostring(
+                chapter_ordinal(copy, index, #chapters)) .. "章"
+            copy._wr_inferred_title = true
+        end
+        prepared[index] = copy
+    end
+    return prepared
+end
+
+function BookLayout.prepare_chapter(chapter, catalog, mode)
+    local prepared = BookLayout.prepare_chapters(catalog, mode)
+    local wanted = tostring(chapter and
+        (chapter.chapterUid or chapter.chapterId) or "")
+    for index, candidate in ipairs(prepared) do
+        local candidate_id = tostring(
+            candidate.chapterUid or candidate.chapterId or "")
+        if candidate == chapter or (wanted ~= "" and candidate_id == wanted) then
+            return candidate
+        end
+    end
+    local copy = {}
+    for key, value in pairs(chapter or {}) do copy[key] = value end
+    return copy
+end
+
 function BookLayout.classify_chapter(xhtml)
     xhtml = BookLayout.sanitize_body(xhtml)
     local images = image_count(xhtml)
