@@ -27,6 +27,13 @@ body.wr-chapter-image { text-align: center; }
 body.wr-chapter-image img,
 body.wr-chapter-image svg { display: block; margin: 0 auto; page-break-inside: avoid; }
 .wr-generated-chapter-heading {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+    position: static !important;
     margin: 2.5em 0 5em;
     padding: 0;
     page-break-after: avoid;
@@ -38,6 +45,10 @@ body.wr-chapter-image svg { display: block; margin: 0 auto; page-break-inside: a
 .wr-generated-chapter-heading h4,
 .wr-generated-chapter-heading h5,
 .wr-generated-chapter-heading h6 {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    height: auto !important;
     margin: 0;
     padding: 0;
     font-size: 1.35em;
@@ -208,12 +219,51 @@ function BookLayout.classify_book(chapters, chapter_bodies)
     return "text"
 end
 
+local function heading_is_hidden(attributes)
+    local attrs = tostring(attributes or ""):lower()
+    if attrs:match("%s+hidden[%s=>]")
+        or attrs:match("aria%-hidden%s*=%s*['\"]?true")
+        or attrs:match("display%s*:%s*none")
+        or attrs:match("visibility%s*:%s*hidden")
+        or attrs:match([=[opacity%s*:%s*0[%s;'"]]=]) then
+        return true
+    end
+    local classes = attrs:match('class%s*=%s*"([^"]*)"')
+        or attrs:match("class%s*=%s*'([^']*)'") or ""
+    classes = " " .. classes:gsub("%s+", " ") .. " "
+    return classes:find(" hidden ", 1, true) ~= nil
+        or classes:find(" visually-hidden ", 1, true) ~= nil
+        or classes:find(" sr-only ", 1, true) ~= nil
+end
+
 function BookLayout.has_visible_title(xhtml, title)
     local expected = compact_text(title)
     if expected == "" then return false end
-    local opening = compact_text(body_contents(xhtml))
-    if opening == "" then return false end
-    return opening:sub(1, #expected) == expected
+    local body = body_contents(xhtml)
+
+    -- A decoded WeRead chapter may contain a title shell whose text is present
+    -- in the DOM but hidden by the chapter stylesheet. Treat only an opening,
+    -- visible semantic heading as an existing title; otherwise smart mode must
+    -- add its own guaranteed-visible heading.
+    for level = 1, 6 do
+        local cursor = 1
+        local pattern = "<[hH]" .. tostring(level)
+            .. "([^>]*)>(.-)</[hH]" .. tostring(level) .. "%s*>"
+        while true do
+            local start_pos, end_pos, attributes, contents =
+                body:find(pattern, cursor)
+            if not start_pos then break end
+            local preceding = compact_text(body:sub(1, start_pos - 1))
+            if preceding == "" and not heading_is_hidden(attributes) then
+                local heading = compact_text(contents)
+                if heading:sub(1, #expected) == expected then
+                    return true
+                end
+            end
+            cursor = end_pos + 1
+        end
+    end
+    return false
 end
 
 local function heading_level(chapter)

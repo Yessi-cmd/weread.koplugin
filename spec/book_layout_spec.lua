@@ -39,6 +39,22 @@ expect(not BookLayout.has_visible_title(
         "<html><head><title>第10章</title></head><body><p>正文</p></body></html>",
         "第10章"),
     "head metadata was mistaken for a visible title")
+local shell_body, _shell_kind, shell_added = BookLayout.prepare_body(
+    '<div class="reader-title-shell">第10章</div><p>正文</p>',
+    { title = "第10章", level = 1 }, "smart")
+expect(shell_added and shell_body:find(
+        '<header class="wr-generated-chapter-heading">', 1, true),
+    "a non-semantic title shell suppressed the generated chapter title")
+local hidden_heading_body, _hidden_kind, hidden_heading_added =
+    BookLayout.prepare_body(
+        '<h1 style="display:none">第10章</h1><p>正文</p>',
+        { title = "第10章", level = 1 }, "smart")
+expect(hidden_heading_added
+        and select(2, hidden_heading_body:gsub(">第10章</h1>", "")) == 2,
+    "a hidden semantic heading suppressed the visible generated title")
+expect(BookLayout.compose_css("header{display:none!important}", "smart")
+        :find("display: block !important", 1, true),
+    "generated chapter heading was not protected from source CSS")
 
 local original_body, _original_kind, original_added = BookLayout.prepare_body(
     "<p>正文</p>", { title = "章节标题" }, "original")
