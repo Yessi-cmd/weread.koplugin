@@ -20,6 +20,7 @@ weread/lib/plugin_util.lua    Shared translation, logging, error, timing, and fi
 weread/lib/reader_lifecycle.lua KOReader lifecycle and reader-state orchestration
 weread/lib/client.lua         HTTP client (cookie-auth Web API + Bearer-auth gateway API)
 weread/lib/book_store.lua     Per-book metadata, reading-state, and article-list persistence
+weread/lib/cache_safety.lua   Cache ownership markers and guarded directory removal
 weread/lib/content.lua        Content decoding (e_0/e_1/e_2/e_3), EPUB/HTML generation
 weread/lib/footnotes.lua      Network-free book-footnote scanning, indexing, conversion, and validation
 weread/lib/cookie.lua         Cookie header parsing and merging
@@ -162,11 +163,12 @@ When the user asks to publish a new version:
 7. Wait for normal CI, the pinned KOReader integration test, and the Release workflow. Verify the tag, release URL, package, and checksum before reporting success.
 8. Generate a vertical release poster in the established warm ivory, forest-green, minimalist editorial style. Give the main feature the strongest visual emphasis and summarize other improvements in smaller cards. Keep contributor acknowledgements in the Changelog unless the user asks to place them on the poster.
 
-## Unimplemented Features (WIP)
+## Experimental Features
 
-These are placeholder menu items shown when a WeRead book is open, currently greyed out:
-- Book details — current-book WeRead metadata display
-- Notes — read-only WeRead highlights/thoughts
+- Public-account browsing uses undocumented Web APIs and may be interrupted by
+  credential expiry, security verification, or temporary server risk controls.
+- The XPointer external annotation overlay is experimental; keep its limitations
+  and manual test procedure synchronized with `docs/xpointer-overlay-prototype.md`.
 
 ## Reference Docs
 

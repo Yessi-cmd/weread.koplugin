@@ -91,7 +91,22 @@ function M:getReadReportMenuItems()
                 else
                     target = cur.book_title ~= "" and cur.book_title or _("Not configured")
                 end
-                local status = report_status.running and _("Running") or _("Stopped")
+                local status
+                if report_status.state == "suspended" then
+                    status = _("Suspended")
+                elseif not report_status.running then
+                    status = _("Stopped")
+                elseif report_status.state == "waiting_for_progress" then
+                    status = _("Waiting for verified reading progress")
+                elseif report_status.state == "offline" then
+                    status = _("Waiting for network")
+                elseif report_status.state == "error" then
+                    status = _("Error")
+                elseif report_status.state == "waiting" then
+                    status = _("Waiting for next report")
+                else
+                    status = _("Running")
+                end
                 local count = report_status.count
                 local last = report_status.last_time
                     and os.date("%H:%M:%S", report_status.last_time) or "--"

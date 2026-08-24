@@ -4,7 +4,7 @@ The release package contains only files needed by KOReader:
 
 - `_meta.lua` and `main.lua`;
 - `weread/` runtime modules;
-- `fonts/`;
+- `integrations/`, `fonts/`, and `icons/`;
 - `README.md`, `LICENSE`, and `NOTICE`.
 
 Development-only directories such as `.github/`, `docs/`, `scripts/`, and
@@ -15,6 +15,7 @@ Development-only directories such as `.github/`, `docs/`, `scripts/`, and
 ## Local package / 本地打包
 
 ```bash
+bash scripts/check_release_metadata.sh
 bash scripts/package_release.sh
 ```
 
@@ -30,7 +31,7 @@ controls the filename:
 - enter a label such as `preview-1` to create
   `weread.koplugin-preview-1.zip`.
 
-A manual run validates the current version, builds the zip and SHA-256
+A manual run validates matching versions and Changelog metadata, builds the zip and SHA-256
 checksum, and uploads them as two separate workflow artifacts retained for 14
 days. It does not create a tag or GitHub Release.
 
@@ -49,8 +50,11 @@ To publish a release:
 6. If `vX.Y.Z` does not already exist, it creates the package, checksum, tag,
    and GitHub Release.
 
-Pushes that keep an existing version do not publish anything. Reusing an
-existing release tag fails deliberately; bump to a new version instead.
+Automatic publishing is decided by the release tag: a push using an already
+published `vX.Y.Z` is skipped, while an untagged version is eligible after the
+required checks pass. This also handles a version bump followed by additional
+same-version commits in one push. Reusing an existing release tag is never
+allowed; bump to a new version instead.
 Automatic packages use the versioned filename
 `weread.koplugin-vX.Y.Z.zip`. The zip and its `.sha256` checksum are separate
 workflow artifacts and separate GitHub Release assets.

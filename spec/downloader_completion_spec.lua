@@ -5,6 +5,8 @@
 package.path = "./?.lua;" .. package.path
 
 local shown = {}
+local scheduled = {}
+local fake_time = 1000
 package.preload["ui/widget/confirmbox"] = function()
     return { new = function(_self, options) return options end }
 end
@@ -19,6 +21,9 @@ package.preload["pluginshare"] = function() return {} end
 package.preload["ui/uimanager"] = function()
     return {
         show = function(_self, widget) shown[#shown + 1] = widget end,
+        scheduleIn = function(_self, _delay, callback)
+            scheduled[#scheduled + 1] = callback
+        end,
         preventStandby = function() end,
         allowStandby = function() end,
     }
@@ -31,7 +36,7 @@ package.preload["logger"] = function()
     }
 end
 package.preload["ui/time"] = function()
-    return { now = function() return 1000 end }
+    return { now = function() return fake_time end }
 end
 package.preload["ffi/util"] = function()
     return {
@@ -72,6 +77,7 @@ package.preload["weread.lib.protocol"] = function()
 end
 
 local Downloader = require("weread.lib.downloader")
+local Content = require("weread.lib.content")
 
 local failures, checks = 0, 0
 local function eq(got, want, label)
@@ -228,6 +234,93 @@ eq(incomplete_full_completion_value, "incomplete_full_book",
     "incomplete full-book completion reason")
 eq(#info_messages, 1,
     "incomplete full-book failure was shown to the user")
+
+Content.available_disk_bytes = function() return 1024 end
+local has_space, space_error = downloader:_hasPackagingSpace({
+    workspace = { path = "/cache/book/workspace" },
+    body_bytes = 1024 * 1024,
+    asset_bytes = 0,
+})
+eq(has_space, false, "low-disk EPUB packaging was refused")
+eq(type(space_error), "string", "low-disk refusal explains the shortage")
+Content.available_disk_bytes = nil
+
+local package_payload
+local package_runner = {
+    run = function(callback)
+        callback(77, 88)
+        return 77, 99
+    end,
+    write_all = function(_fd, payload)
+        package_payload = payload
+        return true
+    end,
+    is_done = function() return true end,
+    read_all = function() return package_payload end,
+    terminate = function() end,
+}
+downloader.package_runner = package_runner
+local async_completion_count = 0
+local async_completion_path
+local async_full = {
+    book = { book_id = "book", title = "Book" },
+    chapters = { chapter, chapter_33 },
+    selected = { chapter, chapter_33 },
+    bodies = { ["22"] = { path = "/tmp/22" }, ["33"] = { path = "/tmp/33" } },
+    assets = {},
+    state = { css = "" },
+    suffix = "full",
+    index = 3,
+    total = 2,
+    failed = {},
+    annotation_failed_batches = 0,
+    footnotes_done = true,
+    started_at = 999,
+    silent_completion = true,
+    on_complete = function(ok, value)
+        async_completion_count = async_completion_count + 1
+        if ok then async_completion_path = value end
+    end,
+}
+downloader:_step(async_full)
+eq(async_full.packaging, true, "combined EPUB packaging moved to subprocess")
+eq(async_completion_count, 0, "subprocess result is polled asynchronously")
+eq(#scheduled, 1, "package poll scheduled")
+table.remove(scheduled, 1)()
+eq(#scheduled, 1, "package completion scheduled guarded finalization")
+table.remove(scheduled, 1)()
+eq(async_completion_count, 1, "async package completion callback count")
+eq(async_completion_path, "/cache/book/replacement-full.epub",
+    "async package completion path")
+eq(full_book_save_count, 1, "combined EPUB built exactly once in child")
+
+local terminated = 0
+local slow_runner = {
+    run = function() return 91, 92 end,
+    write_all = function() return true end,
+    is_done = function() return false end,
+    read_all = function() return nil end,
+    terminate = function() terminated = terminated + 1 end,
+}
+downloader.package_runner = slow_runner
+local slow_dl = {
+    book = { book_id = "book", title = "Book" },
+    selected = { chapter },
+    bodies = { ["22"] = { path = "/tmp/22" } },
+    assets = {},
+    state = { css = "" },
+    suffix = "full",
+}
+fake_time = 1000
+eq(downloader:_startPackageJob(slow_dl), true,
+    "slow package job started")
+fake_time = fake_time + 2 * 1000 * 1000
+table.remove(scheduled, 1)()
+eq(terminated, 0,
+    "microsecond clock did not turn the 15-minute timeout into one second")
+slow_dl.package_job = nil
+slow_dl.packaging = false
+scheduled = {}
 
 print(string.format(
     "downloader_completion_spec: %d checks, %d failure(s)", checks, failures))

@@ -16,7 +16,17 @@ end
 package.preload["bit"] = function()
     return { rshift = function(value, bits) return math.floor(value / 2 ^ bits) end }
 end
-package.preload["weread.lib.crypto"] = function() return {} end
+package.preload["weread.lib.crypto"] = function()
+    return {
+        md5_hex = function(value)
+            local digest = 0
+            for index = 1, #tostring(value or "") do
+                digest = (digest * 33 + tostring(value):byte(index)) % 0x1000000
+            end
+            return string.format("%06x", digest) .. string.rep("0", 26)
+        end,
+    }
+end
 package.preload["weread.lib.reader_state"] = function() return {} end
 package.preload["weread.lib.protocol"] = function()
     return {
@@ -231,5 +241,44 @@ local articles = Content.parse_mp_articles({
 expect(#articles == 1 and articles[1].title == "Article"
     and #articles[1].reviewIds == 3,
     "MP article metadata was not normalized")
+
+local cache_root = os.tmpname() .. "-weread-content-cache"
+os.remove(cache_root)
+assert(os.execute("mkdir -p " .. string.format("%q", cache_root .. "/mp_book")))
+local cache_settings = { cache_dir = cache_root }
+local mp_book = { book_id = "mp_book" }
+local first_article = { title = "Daily Brief", originalId = "article-1" }
+local second_article = { title = "Daily Brief", originalId = "article-2" }
+local first_path = Content.mp_article_path(cache_settings, mp_book, first_article)
+local second_path = Content.mp_article_path(cache_settings, mp_book, second_article)
+expect(first_path ~= second_path
+        and first_path == Content.mp_article_path(cache_settings, mp_book, first_article),
+    "same-title MP articles did not receive stable distinct cache paths")
+local legacy_path = Content.mp_article_legacy_path(
+    cache_settings, mp_book, first_article)
+local legacy_file = assert(io.open(legacy_path, "wb"))
+legacy_file:write("legacy article")
+legacy_file:close()
+expect(Content.mp_article_cached_path(cache_settings, mp_book, first_article)
+        == legacy_path,
+    "legacy title-only MP article cache was not discovered")
+
+local previous_catalog_limit = Content.MAX_CATALOG_CACHE_BYTES
+Content.MAX_CATALOG_CACHE_BYTES = 4
+local catalog_path = cache_root .. "/mp_book/catalog.json"
+local oversized_catalog = assert(io.open(catalog_path, "wb"))
+oversized_catalog:write("12345")
+oversized_catalog:close()
+local decode_count = 0
+local cached_catalog = Content.load_catalog_cache({
+    json_decode = function()
+        decode_count = decode_count + 1
+        return { chapters = {} }
+    end,
+}, cache_settings, mp_book)
+Content.MAX_CATALOG_CACHE_BYTES = previous_catalog_limit
+expect(cached_catalog == nil and decode_count == 0,
+    "oversized catalog cache was read into memory or decoded")
+os.execute("rm -rf " .. string.format("%q", cache_root))
 
 print(("content_annotations_spec: %d checks"):format(checks))

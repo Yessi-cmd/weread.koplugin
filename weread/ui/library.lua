@@ -999,14 +999,15 @@ function M:fetchMPArticles(book)
             if ticket == "" then ticket = nil end
             return self.client:get_mp_articles(book_id, 0, 100, ticket)
         end
-        local ok, result, err_code = pcall(request_articles)
-        if ok and not result and (err_code == -2041 or err_code == -2012) then
+        local ok, result, err_code, err_kind = pcall(request_articles)
+        if ok and not result and (err_kind == "mp_credentials_expired"
+            or err_code == -2041 or err_code == -2012) then
             logger.info("MP credentials rejected; renewing before retry")
             local renew_ok = pcall(function()
                 return self.client:renew_cookie()
             end)
             if renew_ok then
-                ok, result, err_code = pcall(request_articles)
+                ok, result, err_code, err_kind = pcall(request_articles)
             end
         end
         self:closeBusy()
@@ -1015,9 +1016,17 @@ function M:fetchMPArticles(book)
             self:showInfo(T(_("Load articles failed:\n%1"), display_error(result)))
             return
         end
-        if not result and (err_code == -2041 or err_code == -2012) then
+        if not result and (err_kind == "mp_credentials_expired"
+            or err_code == -2041 or err_code == -2012) then
             logger.warn("load MP articles rejected, error_code:", tostring(err_code))
             self:showInfo(_("WeRead could not refresh the public-account credential. Please scan the QR code again."))
+            return
+        end
+        if not result and err_kind then
+            logger.warn("load MP articles blocked:", tostring(err_kind),
+                "error_code:", tostring(err_code))
+            self:showInfo(T(_("Load articles failed:\n%1"),
+                display_error(err_kind)))
             return
         end
         if not result then

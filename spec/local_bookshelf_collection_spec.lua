@@ -77,6 +77,7 @@ package.preload["ffi/util"] = function()
 end
 package.preload["weread.lib.content"] = function()
     return {
+        filename_safe = function(value) return tostring(value or "") end,
         save_chapter_epub = function(_settings, _book, chapter)
             return "/cache/book/chapter-" .. tostring(chapter.chapterUid) .. ".epub"
         end,
@@ -228,6 +229,20 @@ package.preload["ui/widget/pathchooser"] = function()
     return { new = function(_self, options) return options end }
 end
 package.preload["weread.lib.scan"] = function() return {} end
+local refused_cache_path
+package.preload["weread.lib.cache_safety"] = function()
+    return {
+        has_legacy_file_evidence = function() return true end,
+        make_path = function() return true end,
+        mark = function() return true end,
+        shell_quote = function(value) return tostring(value) end,
+        validate_owned = function() return true end,
+        remove_book_dir = function(path)
+            if path == refused_cache_path then return nil, "unowned" end
+            return true
+        end,
+    }
+end
 package.preload["weread.lib.logger"] = function()
     return {
         info = function() end,
@@ -262,6 +277,8 @@ local function make_cache_host(books)
     local stored = books
     local host = {
         settings = {
+            cache_dir = "/cache",
+            default_cache_dir = "/cache",
             get = function(_self, key, default)
                 if key == "books" then return stored end
                 return default
@@ -277,6 +294,16 @@ local function make_cache_host(books)
         host[key] = value
     end
     return host
+end
+
+do
+    local host = make_cache_host({})
+    local root_ok = host:validateDownloadDir("/")
+    local relative_ok = host:validateDownloadDir("relative/cache")
+    local traversal_ok = host:validateDownloadDir("/cache/../other")
+    eq(root_ok, false, "filesystem root rejected as cache directory")
+    eq(relative_ok, false, "relative cache directory rejected")
+    eq(traversal_ok, false, "traversal cache directory rejected")
 end
 
 -- clearBookCache removes the full-book path from the collection.
@@ -309,6 +336,24 @@ do
     eq(#coll_removes, 2, "clearAllCache removes each book")
     eq(coll_removes[1] and coll_removes[1].no_write, true, "clearAllCache deferred write")
     eq(coll_writes >= 1 and true or false, true, "clearAllCache batch write")
+end
+
+-- A refused directory stays in settings and is not removed from the collection.
+coll_adds, coll_removes, coll_writes = {}, {}, 0
+do
+    refused_cache_path = "/cache/b"
+    local host = make_cache_host({
+        a = { cached_file = "/cache/a/full.epub" },
+        b = { cached_file = "/cache/b/full.epub" },
+    })
+    local cleared, failed = host:clearAllCache()
+    local remaining = host.settings:get("books", {})
+    eq(cleared, false, "partial clear reports failure")
+    eq(failed.b, "unowned", "partial clear returns refusal reason")
+    eq(remaining.a, nil, "safely cleared record removed")
+    eq(type(remaining.b), "table", "unsafe record preserved")
+    eq(#coll_removes, 1, "unsafe collection item preserved")
+    refused_cache_path = nil
 end
 
 -- clearAllMPCache only removes MP books.

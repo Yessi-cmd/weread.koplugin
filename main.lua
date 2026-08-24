@@ -26,10 +26,12 @@ local _ = PluginUtil.tr
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "1.2.0",
-    -- This customized build must never install the public upstream release over
-    -- itself. Future private updates are installed manually from a verified ZIP.
+    version = "1.3.0",
+    -- Keep this customized build on its own checksummed release channel;
+    -- never install the public upstream package over it.
     private_build = true,
+    private_updates_enabled = true,
+    update_repository = "Yessi-cmd/weread.koplugin",
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -56,6 +58,7 @@ function WeReadPlugin:init()
     local updater = Updater:new{
         settings = self.settings,
         current_version = self.version,
+        repository = self.update_repository,
     }
     self.updater = UpdaterUI:new{
         updater = updater,
@@ -220,7 +223,7 @@ function WeReadPlugin:init()
         self.read_report:maybe_start("plugin_start")
     end
     self._reader_session_gen = 0
-    if not self.private_build then
+    if not self.private_build or self.private_updates_enabled then
         self.updater:schedule_auto_check()
     end
     logger.info("initialized:", "version=", self.version)

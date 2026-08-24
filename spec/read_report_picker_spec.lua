@@ -14,7 +14,12 @@ package.preload["weread.ui.read_stats_view"] = function() return {} end
 package.preload["weread.lib.plugin_util"] = function()
     return {
         tr = function(text) return text end,
-        T = function(text, value) return text:gsub("%%1", tostring(value)) end,
+        T = function(text, ...)
+            local values = { ... }
+            return (text:gsub("%%(%d+)", function(index)
+                return tostring(values[tonumber(index)] or "")
+            end))
+        end,
         log_error = tostring,
         display_error = tostring,
     }
@@ -45,6 +50,16 @@ local host = setmetatable({
     stopReadReport = function(_self, reason) stopped = reason end,
     maybeStartReadReport = function() started = true end,
     showTransientInfo = function(_self, text) notice = text end,
+    showInfo = function(_self, text) notice = text end,
+    read_report = {
+        status = function()
+            return {
+                running = false,
+                state = "suspended",
+                count = 0,
+            }
+        end,
+    },
     safeCallback = function(_self, _label, callback) return callback end,
 }, { __index = ReadReportUI })
 
@@ -70,6 +85,9 @@ target_items[1].callback(touchmenu)
 target_items[2].callback(touchmenu)
 expect(menu_refreshes == 4,
     "reading report toggles did not refresh the open menu")
+report_items[4].callback()
+expect(notice and notice:find("Status: Suspended", 1, true),
+    "suspended report state was shown as stopped")
 
 host:showReadReportBookPicker()
 expect(picker_options and picker_options.mode == "books",

@@ -212,6 +212,7 @@ function ReadReport:status()
         last_error = self.last_error,
         last_error_kind = self.last_error_kind,
         stop_reason = self.stop_reason,
+        wait_reason = self.last_skip,
         target_book_id = self.current_book_id,
         target_book_title = self.current_book_title,
         target_source = self.current_book_source,

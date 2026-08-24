@@ -7,6 +7,8 @@ ProgressSync.__index = ProgressSync
 
 local OPEN_DELAY_SECONDS = 0.6
 local RESUME_RECHECK_SECONDS = 5 * 60
+local PULL_RETRY_DELAY_SECONDS = 15
+local PULL_MAX_RETRIES = 3
 local BUSY_RETRY_SECONDS = 2
 local BUSY_RETRY_LIMIT = 10
 local SAME_THRESHOLD_PERCENT = 2
@@ -99,6 +101,15 @@ end
 function ProgressSync:_cancel_periodic_upload()
     local task = self.periodic_upload_task
     self.periodic_upload_task = nil
+    if task and type(self.scheduler.unschedule) == "function" then
+        pcall(self.scheduler.unschedule, self.scheduler, task)
+    end
+end
+
+function ProgressSync:_cancel_pull_retry()
+    local task = self.pull_retry_task
+    self.pull_retry_task = nil
+    self.pull_retry_attempt = nil
     if task and type(self.scheduler.unschedule) == "function" then
         pcall(self.scheduler.unschedule, self.scheduler, task)
     end
@@ -268,6 +279,7 @@ function ProgressSync:capture_local()
 end
 
 function ProgressSync:_mark_verified(book_id, reason, local_position, remote)
+    self:_cancel_pull_retry()
     self.current_book_id = tostring(book_id)
     self.verified = true
     self.verified_at = self.now()
@@ -565,6 +577,48 @@ function ProgressSync:_resolve(local_position, remote, context, options)
     end
 end
 
+-- Automatic progress verification often fires while Wi-Fi is still restoring
+-- after wake. Keep one bounded retry chain for the current document. A queued
+-- callback is made inert by both identity and generation checks, so changing
+-- books, closing the document, or suspending cannot revive stale network work.
+function ProgressSync:_schedule_pull_retry(options)
+    options = options or {}
+    if self.pull_retry_task then return true end
+    local attempt = (tonumber(options.retry) or 0) + 1
+    if attempt > PULL_MAX_RETRIES then
+        self.pull_retry_attempt = nil
+        log("warn", "pull retries exhausted:",
+            "book=", tostring(self.current_book_id))
+        return false
+    end
+
+    local generation = self.generation
+    local book_id = tostring(self.current_book_id or self.detect_book() or "")
+    local task
+    task = function()
+        if self.pull_retry_task ~= task then return end
+        self.pull_retry_task = nil
+        if generation ~= self.generation
+            or tostring(self.detect_book() or "") ~= book_id then
+            self.pull_retry_attempt = nil
+            return
+        end
+        if self.verified or self.pulling or self.suspended then
+            self.pull_retry_attempt = nil
+            return
+        end
+        self:_pull({ manual = false, retry = attempt })
+    end
+    self.pull_retry_task = task
+    self.pull_retry_attempt = attempt
+    self.scheduler:scheduleIn(PULL_RETRY_DELAY_SECONDS, task)
+    log("info", "pull retry scheduled:",
+        "book=", book_id,
+        "attempt=", tostring(attempt),
+        "delay=", tostring(PULL_RETRY_DELAY_SECONDS))
+    return true
+end
+
 function ProgressSync:_pull(options)
     options = options or {}
     if self.pulling then return false end
@@ -586,10 +640,15 @@ function ProgressSync:_pull(options)
     end
     if not self.is_online() then
         self.state = "offline"
-        if options.manual then self.notify("offline", {}) end
+        if options.manual then
+            self.notify("offline", {})
+        else
+            self:_schedule_pull_retry(options)
+        end
         return false
     end
 
+    self:_cancel_pull_retry()
     local generation = self.generation
     self.pulling = true
     self.state = "pulling"
@@ -633,6 +692,8 @@ function ProgressSync:_pull(options)
             })
             if options.manual then
                 self.notify("pull_failed", { error = tostring(pull_error) })
+            else
+                self:_schedule_pull_retry(options)
             end
             return
         end
@@ -647,7 +708,11 @@ function ProgressSync:_pull(options)
     if not started then
         self.pulling = false
         self.state = "offline"
-        if options.manual then self.notify("offline", {}) end
+        if options.manual then
+            self.notify("offline", {})
+        else
+            self:_schedule_pull_retry(options)
+        end
     end
     return started == true
 end
@@ -701,6 +766,7 @@ end
 
 function ProgressSync:on_reader_ready()
     self:_cancel_periodic_upload()
+    self:_cancel_pull_retry()
     self.generation = self.generation + 1
     local generation = self.generation
     self.current_book_id = nil
@@ -752,6 +818,7 @@ end
 
 function ProgressSync:on_close_document()
     self:_cancel_periodic_upload()
+    self:_cancel_pull_retry()
     local position = self:capture_local() or self.local_position
     if position and self.verified
         and self:_config().upload_on_close == true then
@@ -774,6 +841,7 @@ end
 function ProgressSync:on_suspend()
     self.suspended = true
     self:_cancel_periodic_upload()
+    self:_cancel_pull_retry()
     self.suspended_at = self.now()
     local position = self:capture_local() or self.local_position
     if position and self.local_position
@@ -790,9 +858,9 @@ function ProgressSync:on_resume()
     self.suspended = false
     local slept = self.suspended_at and self.now() - self.suspended_at or 0
     self.suspended_at = nil
-    if slept >= RESUME_RECHECK_SECONDS
-        and self:_config().pull_on_open == true then
-        self:_clear_verified("resume_recheck")
+    if self:_config().pull_on_open == true
+        and (not self.verified or slept >= RESUME_RECHECK_SECONDS) then
+        if self.verified then self:_clear_verified("resume_recheck") end
         self:_pull({ manual = false })
         return
     end
@@ -800,6 +868,7 @@ function ProgressSync:on_resume()
 end
 
 function ProgressSync:sync_now()
+    self:_cancel_pull_retry()
     return self:_pull({ manual = true })
 end
 
@@ -832,6 +901,9 @@ function ProgressSync:status()
         dirty = self.dirty,
         pulling = self.pulling == true,
         uploading = self.uploading == true,
+        pull_retry_scheduled = self.pull_retry_task ~= nil,
+        pull_retry_attempt = self.pull_retry_attempt,
+        pull_retry_limit = PULL_MAX_RETRIES,
         periodic_upload_scheduled = self.periodic_upload_task ~= nil,
         upload_interval_minutes = tonumber(
             self:_config().upload_interval_minutes) or 0,

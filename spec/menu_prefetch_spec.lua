@@ -310,9 +310,10 @@ local cache_items = cache_management and cache_management.sub_item_table_func() 
 expect(cache_items[1] and cache_items[1].keep_menu_open == true
         and cache_items[2] and cache_items[2].keep_menu_open == true,
     "cache dialogs keep the settings menu open")
-local download_items = download_settings and download_settings.sub_item_table_func()
+local download_settings_items = download_settings
+    and download_settings.sub_item_table_func()
 local prefetch
-for _, item in ipairs(download_items or {}) do
+for _, item in ipairs(download_settings_items or {}) do
     if item.text == "Chapter prefetch" then prefetch = item end
 end
 expect(prefetch ~= nil, "download settings contain a prefetch submenu")

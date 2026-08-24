@@ -22,6 +22,8 @@ local function test(name, fn)
     fn()
 end
 
+local PULL_RETRY_DELAY_SECONDS = 15
+
 local chapters = {
     { chapterUid = 11, chapterIdx = 1, wordCount = 100 },
     { chapterUid = 22, chapterIdx = 2, wordCount = 300 },
@@ -69,8 +71,15 @@ local function fixture(remote, options)
     }
     local queue = {}
     local scheduler = {
-        scheduleIn = function(_self, _delay, callback)
-            queue[#queue + 1] = callback
+        scheduleIn = function(_self, delay, callback)
+            queue[#queue + 1] = { delay = delay, callback = callback }
+        end,
+        unschedule = function(_self, callback)
+            for index = #queue, 1, -1 do
+                if queue[index].callback == callback then
+                    table.remove(queue, index)
+                end
+            end
         end,
     }
     local choices = {}
@@ -121,12 +130,18 @@ local function fixture(remote, options)
         is_online = options.is_online,
         is_time_reporting = options.is_time_reporting,
     }
+    local function step()
+        local entry = table.remove(queue, 1)
+        if not entry then return false end
+        entry.callback()
+        return true
+    end
     local function drain()
         local count = 0
         while #queue > 0 do
             count = count + 1
             assert(count < 20, "scheduler did not quiesce")
-            table.remove(queue, 1)()
+            step()
         end
     end
     return {
@@ -137,6 +152,8 @@ local function fixture(remote, options)
         uploads = uploads,
         jumps = jumps,
         notifications = notifications,
+        queue = queue,
+        step = step,
         drain = drain,
     }
 end
@@ -520,6 +537,122 @@ test("offline manual catalog refresh reports offline instead of raw reason", fun
     eq(refresh_count, 0, "offline path does not refresh")
     eq(#f.notifications, 1, "offline failure notifies once")
     eq(f.notifications[1].code, "offline", "offline message is explicit")
+end)
+
+test("offline automatic pull keeps one delayed retry chain", function()
+    local f = fixture({}, {
+        is_online = function() return false end,
+    })
+    f.sync:on_reader_ready()
+    f.step()
+    eq(f.sync:status().state, "offline", "automatic pull records offline")
+    eq(#f.queue, 1, "one retry queued")
+    eq(f.queue[1].delay, PULL_RETRY_DELAY_SECONDS, "retry delay")
+    eq(f.sync:status().pull_retry_scheduled, true, "retry visible in status")
+    eq(f.sync:status().pull_retry_attempt, 1, "retry attempt visible")
+    eq(#f.notifications, 0, "automatic retry stays silent")
+    -- A second automatic trigger must not create another chain.
+    f.sync:_pull({ manual = false })
+    eq(#f.queue, 1, "duplicate retry suppressed")
+end)
+
+test("automatic pull retries stop at the attempt limit", function()
+    local f = fixture({}, {
+        is_online = function() return false end,
+    })
+    f.sync:on_reader_ready()
+    f.step()
+    eq(#f.queue, 1, "first retry queued")
+    f.step()
+    eq(#f.queue, 1, "second retry queued")
+    f.step()
+    eq(#f.queue, 1, "third retry queued")
+    f.step()
+    eq(#f.queue, 0, "retry limit reached")
+    eq(f.sync:status().pull_retry_scheduled, false, "no retry remains")
+    eq(f.sync:status().verified, false, "gate remains closed")
+end)
+
+test("manual sync cancels an automatic retry and does not replace it", function()
+    local f = fixture({}, {
+        is_online = function() return false end,
+    })
+    f.sync:on_reader_ready()
+    f.step()
+    eq(#f.queue, 1, "automatic retry queued")
+    eq(f.sync:sync_now(), false, "manual offline sync does not start")
+    eq(#f.queue, 0, "manual path cancelled automatic retry")
+    eq(#f.notifications, 1, "manual offline notifies once")
+    eq(f.notifications[1].code, "offline", "offline message is explicit")
+end)
+
+test("closing and suspending cancel queued pull retries", function()
+    local online_checks = 0
+    local f = fixture({}, {
+        is_online = function()
+            online_checks = online_checks + 1
+            return false
+        end,
+    })
+    f.sync:on_reader_ready()
+    f.step()
+    eq(#f.queue, 1, "retry queued before close")
+    f.sync:on_close_document()
+    eq(#f.queue, 0, "close unscheduled retry")
+    eq(online_checks, 1, "close performed no extra network check")
+
+    f.sync:on_reader_ready()
+    f.step()
+    eq(#f.queue, 1, "retry queued before suspend")
+    f.sync:on_suspend()
+    eq(#f.queue, 0, "suspend unscheduled retry")
+end)
+
+test("resume restarts verification after a suspended retry", function()
+    local online = false
+    local f = fixture({
+        bookId = "book",
+        progress = 25,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 150,
+    }, {
+        is_online = function() return online end,
+    })
+    f.sync:on_reader_ready()
+    f.step()
+    eq(#f.queue, 1, "offline retry queued")
+    f.sync:on_suspend()
+    eq(#f.queue, 0, "retry cancelled for suspend")
+    online = true
+    f.sync:on_resume()
+    f.drain()
+    eq(f.sync:status().verified, true,
+        "resume restarted the unverified pull")
+end)
+
+test("a queued retry verifies after Wi-Fi returns", function()
+    local online = false
+    local f = fixture({
+        bookId = "book",
+        progress = 25,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 150,
+        updateTime = 10,
+    }, {
+        is_online = function() return online end,
+    })
+    f.sync:on_reader_ready()
+    f.step()
+    eq(f.sync:status().verified, false, "offline open remains gated")
+    online = true
+    f.drain()
+    eq(f.sync:status().verified, true, "retry verifies gate")
+    eq(f.sync:status().pull_retry_scheduled, false, "retry cleared")
+    local position, reason = f.sync:position_for_report("book")
+    eq(reason, nil, "no gate reason")
+    eq(position.chapter_uid, 22, "live chapter")
 end)
 
 print(string.format(

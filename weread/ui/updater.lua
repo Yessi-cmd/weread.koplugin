@@ -282,7 +282,9 @@ end
 function UpdaterUI:schedule_auto_check()
     local state = self.settings:get("update")
     if state.auto_check ~= true then return end
-    local last = tonumber(state.last_check) or 0
+    local last = type(self.updater.last_check_time) == "function"
+        and self.updater:last_check_time()
+        or tonumber(state.last_check) or 0
     if os.time() - last < self.updater.AUTO_CHECK_INTERVAL then return end
     UIManager:scheduleIn(5, function()
         if self.is_connected() then self:check(false) end

@@ -66,6 +66,8 @@ expect(exists(index.cache_dir .. "/reading_state.json"),
     "reading-state file was not written")
 expect(exists(index.cache_dir .. "/articles.json"),
     "article file was not written")
+expect(exists(index.cache_dir .. "/.weread-cache-owner"),
+    "cache ownership marker was not written")
 
 local loaded = BookStore.load(settings, "book/42", index)
 expect(loaded.title == "Fixture book" and loaded.author == "Fixture author",
@@ -93,8 +95,78 @@ expect(loaded.title == "Metadata only"
     and loaded.progress == nil and loaded.mp_articles == nil,
     "removed split state reappeared after reload")
 
-os.remove(index.cache_dir .. "/metadata.json")
-os.remove(index.cache_dir)
-os.remove(root)
+local unowned_parent = os.tmpname() .. "-weread-unowned"
+local unowned_path = unowned_parent .. "/arbitrary"
+local refused, refused_err = BookStore.save(settings, "book/42", {
+    book_id = "book/42",
+    cache_dir = unowned_path,
+    title = "Must not be written",
+})
+expect(refused == false and refused_err ~= nil,
+    "unowned persisted path was accepted for metadata writes")
+local absent_status = os.execute(
+    "test ! -e " .. string.format("%q", unowned_parent))
+expect(absent_status == true or absent_status == 0,
+    "unowned persisted path was created before validation")
+
+local preserved, preserved_index = BookStore.save(settings, "book/42", {
+    book_id = "book/42",
+    cache_dir = unowned_path,
+    title = "Preserved unsafe record",
+}, { preserve_unowned_index = true })
+expect(preserved == true and preserved_index.cache_dir == unowned_path
+    and BookStore.load(settings, "book/42", preserved_index).title
+        == "Preserved unsafe record"
+    and BookStore.is_minimal_index({ ["book/42"] = preserved_index }),
+    "unowned record could not be preserved as a non-writing index")
+
+assert(os.execute("mkdir -p " .. string.format("%q", root .. "/collision")))
+local collision_ok = BookStore.save(settings, "collision", {
+    book_id = "collision",
+    title = "Must not claim a same-name directory",
+})
+expect(collision_ok == false,
+    "an existing same-name directory was claimed without cache evidence")
+
+local legacy_dir = root .. "/legacy"
+assert(os.execute("mkdir -p " .. string.format("%q", legacy_dir)))
+local legacy_epub = assert(io.open(legacy_dir .. "/old.epub", "wb"))
+legacy_epub:write("legacy")
+legacy_epub:close()
+local legacy_ok = BookStore.save(settings, "legacy", {
+    book_id = "legacy",
+    cached_file = legacy_dir .. "/old.epub",
+    title = "Migrated legacy cache",
+})
+expect(legacy_ok == true
+    and exists(legacy_dir .. "/.weread-cache-owner"),
+    "a verified legacy cache could not be migrated")
+
+assert(os.execute("mkdir -p " .. string.format("%q", unowned_path)))
+encoded_values["foreign-metadata"] = { title = "Foreign metadata" }
+local foreign = assert(io.open(unowned_path .. "/metadata.json", "wb"))
+foreign:write("foreign-metadata")
+foreign:close()
+local safely_loaded = BookStore.load(settings, "book/42", {
+    cache_dir = unowned_path,
+    title = "Inline title",
+})
+expect(safely_loaded.title == "Inline title",
+    "metadata was read from an unowned persisted directory")
+
+local oversized_metadata = assert(io.open(
+    index.cache_dir .. "/metadata.json", "wb"))
+assert(oversized_metadata:seek("set", BookStore.MAX_METADATA_BYTES))
+oversized_metadata:write("x")
+oversized_metadata:close()
+local bounded_load = BookStore.load(settings, "book/42", {
+    cache_dir = index.cache_dir,
+    title = "Bounded fallback",
+})
+expect(bounded_load.title == "Bounded fallback",
+    "oversized metadata cache replaced the safe in-memory fallback")
+
+os.execute("rm -rf " .. string.format("%q", root))
+os.execute("rm -rf " .. string.format("%q", unowned_parent))
 
 print(("book_store_spec: %d checks"):format(checks))

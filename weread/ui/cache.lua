@@ -1,6 +1,7 @@
 -- Cache settings, directory selection, scanning, and cleanup UI.
 local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
+local CacheSafety = require("weread.lib.cache_safety")
 local Content = require("weread.lib.content")
 local logger = require("weread.lib.logger")
 local PathChooser = require("ui/widget/pathchooser")
@@ -17,6 +18,29 @@ local file_exists = PluginUtil.file_exists
 
 local M = {}
 
+local function legacy_article_paths(book_id, book, cache_dir)
+    local paths = {}
+    if not WeRead.is_mp_book(book_id) then return paths end
+    for _, article in pairs(book.mp_articles or {}) do
+        if type(article) == "table" then
+            for _, name in ipairs({
+                Content.mp_article_filename(article),
+                Content.mp_article_legacy_filename(article),
+            }) do
+                local html_path = cache_dir .. "/" .. name .. ".html"
+                table.insert(paths, html_path)
+                table.insert(paths, html_path:gsub("%.html$", ".epub"))
+            end
+        end
+    end
+    return paths
+end
+
+local function legacy_cache_evidence(book_id, book, cache_dir)
+    return CacheSafety.has_legacy_file_evidence(
+        cache_dir, book, legacy_article_paths(book_id, book, cache_dir))
+end
+
 function M:setMPImageDownload(enabled)
     local cache = self.settings:get("cache")
     cache.download_mp_images = enabled == true
@@ -31,23 +55,40 @@ end
 
 -- Returns true if the directory is usable (creatable and writable), else false + message.
 function M:validateDownloadDir(path)
-    local lfs = require("libs/libkoreader-lfs")
-    if type(path) ~= "string" or path == "" then
+    if type(path) == "string" and path ~= "/" then
+        path = path:gsub("/+$", "")
+    end
+    if type(path) ~= "string" or path == "" or path == "/"
+        or path:sub(1, 1) ~= "/" or path:find("%z") then
         return false, _("Invalid path.")
     end
-    if not lfs.attributes(path, "mode") then
-        os.execute("mkdir -p " .. string.format("%q", path))
-        if not lfs.attributes(path, "mode") then
-            return false, _("Directory does not exist and could not be created.")
+    for component in path:gmatch("[^/]+") do
+        if component == "." or component == ".." then
+            return false, _("Invalid path.")
         end
     end
-    local test_file = path .. "/.weread_write_test"
-    local f = io.open(test_file, "w")
+    local lfs = require("libs/libkoreader-lfs")
+    local mode = lfs.attributes(path, "mode")
+    if not mode then
+        local made = CacheSafety.make_path(path)
+        if not made or not lfs.attributes(path, "mode") then
+            return false, _("Directory does not exist and could not be created.")
+        end
+    elseif mode ~= "directory" then
+        return false, _("Invalid path.")
+    end
+    local test_file = string.format("%s/.weread-write-test-%d-%06d",
+        path, os.time(), math.random(0, 999999))
+    local f = io.open(test_file, "wb")
     if not f then
         return false, _("Directory is not writable.")
     end
-    f:close()
+    local wrote = f:write("weread-write-test\n")
+    local closed = f:close()
     os.remove(test_file)
+    if not wrote or not closed then
+        return false, _("Directory is not writable.")
+    end
     return true
 end
 
@@ -58,6 +99,9 @@ function M:showDownloadDirPicker(touchmenu_instance)
         select_file = false,
         path = current,
         onConfirm = function(path)
+            if type(path) == "string" and path ~= "/" then
+                path = path:gsub("/+$", "")
+            end
             local ok, err = self:validateDownloadDir(path)
             if not ok then
                 self:showInfo(T(_("Cannot use this directory: %1"), err))
@@ -92,7 +136,13 @@ function M:offerMoveBooksToNewDir(old_dir, new_dir)
         if src ~= dst then
             local attr = lfs.attributes(src)
             if attr and attr.mode == "directory" then
-                table.insert(movable, { book_id = book_id, src = src, dst = dst })
+                table.insert(movable, {
+                    book_id = book_id,
+                    book = book,
+                    src = src,
+                    dst = dst,
+                    source_root = old_dir,
+                })
             end
         end
     end
@@ -120,7 +170,9 @@ function M:moveBooksToNewDir(movable, new_dir)
         local moved, skipped, failed = 0, 0, 0
         local collection_updates = {}
         for _i, m in ipairs(movable) do
-            local ok, reason = self:moveBookDir(m.src, m.dst)
+            local ok, reason = self:moveBookDir(
+                m.src, m.dst, m.book_id, m.source_root,
+                books[m.book_id] or m.book)
             if ok then
                 local book = books[m.book_id]
                 if book then
@@ -186,22 +238,44 @@ end
 -- Move one book directory to dst. Uses `mv`, which (unlike os.rename) handles
 -- moves across filesystems, e.g. internal storage to an SD card. Returns
 -- true on success, or false plus a reason ("target_exists" / "move_failed").
-function M:moveBookDir(src, dst)
+function M:moveBookDir(src, dst, book_id, source_root, book)
     if src == dst then
         return true
     end
     local lfs = require("libs/libkoreader-lfs")
     if lfs.attributes(dst) then
-        -- The target already exists. Since the new directory is user-selected, it
-        -- may be unrelated user data that only happens to share the sanitized name.
-        -- Never delete it; leave the book in its old location instead.
+        -- The target may be unrelated user data that only happens to share the
+        -- sanitized name. Never overwrite or merge into it.
         return false, "target_exists"
+    end
+    local safe_target = CacheSafety.validate_owned(dst, book_id, {
+        roots = { self.settings.cache_dir },
+        allow_new_child = true,
+        lfs = lfs,
+    })
+    if not safe_target then return false, "unsafe_target" end
+    local owned, owner_err = CacheSafety.validate_owned(src, book_id, {
+        roots = { source_root, self.settings.cache_dir,
+            self.settings.default_cache_dir },
+        legacy_evidence = legacy_cache_evidence(book_id, book or {}, src),
+        lfs = lfs,
+    })
+    if not owned then
+        logger.err("refuse to move unowned book cache:", src, owner_err)
+        return false, "unsafe_source"
+    end
+    local marked, mark_err = CacheSafety.mark(src, book_id)
+    if not marked then
+        logger.err("could not mark book cache before move:", src, mark_err)
+        return false, "unsafe_source"
     end
     local parent = dst:match("^(.*)/[^/]+$")
     if parent then
-        os.execute("mkdir -p " .. string.format("%q", parent))
+        local made = CacheSafety.make_path(parent)
+        if not made then return false, "move_failed" end
     end
-    local status = os.execute("mv -f " .. string.format("%q", src) .. " " .. string.format("%q", dst))
+    local status = os.execute("mv -f " .. CacheSafety.shell_quote(src)
+        .. " " .. CacheSafety.shell_quote(dst))
     if status == true or status == 0 then
         return true
     end
@@ -479,7 +553,7 @@ function M:showCacheManagement()
 
     -- Only list plugin-owned entries tracked in the books table. Scanning the
     -- filesystem would list unrelated subfolders when cache_dir is a user-selected
-    -- library directory, and deleting one would rm -rf a non-WeRead folder.
+    -- library directory, and deleting one could remove a non-WeRead folder.
     for book_id, book in pairs(books) do
         add_cache_entry(book_id, book.title, Content.book_resolved_dir(self.settings, book_id, book))
     end
@@ -504,8 +578,17 @@ function M:showCacheManagement()
                 text = _("Clear all public account cache? Downloaded articles and cached article lists will be deleted."),
                 ok_text = _("Clear"),
                 ok_callback = function()
-                    self:clearAllMPCache()
-                    self:refreshCacheManagement(_("Public account cache cleared"))
+                    local ok, failed = self:clearAllMPCache()
+                    if ok then
+                        self:refreshCacheManagement(
+                            _("Public account cache cleared"))
+                    else
+                        local count = 0
+                        for _ in pairs(failed or {}) do count = count + 1 end
+                        self:refreshCacheManagement(T(_(
+                            "Public account cache was partly cleared; %1 unsafe item(s) were kept."),
+                            tostring(count)))
+                    end
                 end,
             })
         end),
@@ -518,8 +601,16 @@ function M:showCacheManagement()
                 text = _("Clear all cache? Downloaded books and articles will be deleted."),
                 ok_text = _("Clear"),
                 ok_callback = function()
-                    self:clearAllCache()
-                    self:refreshCacheManagement(_("Cache cleared"))
+                    local ok, failed = self:clearAllCache()
+                    if ok then
+                        self:refreshCacheManagement(_("Cache cleared"))
+                    else
+                        local count = 0
+                        for _ in pairs(failed or {}) do count = count + 1 end
+                        self:refreshCacheManagement(T(_(
+                            "Cache was partly cleared; %1 unsafe item(s) were kept."),
+                            tostring(count)))
+                    end
                 end,
             })
         end),
@@ -667,7 +758,12 @@ function M:confirmClearBookCache(book_id, title, on_cleared)
         text = T(_("Clear cache for \"%1\"?"), title),
         ok_text = _("Clear"),
         ok_callback = function()
-            self:clearBookCache(book_id)
+            local ok, err = self:clearBookCache(book_id)
+            if not ok then
+                self:showInfo(T(_("Cache cleanup was refused:\n%1"),
+                    display_error(err)))
+                return
+            end
             if on_cleared then
                 on_cleared()
                 self:showTransientInfo(_("Cache cleared"))
@@ -678,17 +774,36 @@ function M:confirmClearBookCache(book_id, title, on_cleared)
     })
 end
 
+local function cache_roots(self)
+    return { self.settings.cache_dir, self.settings.default_cache_dir }
+end
+
+function M:removeOwnedBookCache(book_id, book)
+    if type(book) ~= "table" then
+        return nil, "cache entry not found"
+    end
+    local cache_dir = Content.book_resolved_dir(
+        self.settings, book_id, book)
+    return CacheSafety.remove_book_dir(cache_dir, book_id, {
+        roots = cache_roots(self),
+        legacy_evidence = legacy_cache_evidence(book_id, book, cache_dir),
+    })
+end
+
 function M:clearBookCache(book_id)
     local books = self.settings:get("books", {})
     local book = books[book_id]
+    if not book then return nil, "cache entry not found" end
     local path_to_remove = book and (book.cached_full_book or book.cached_file)
-    local cache_dir = Content.book_resolved_dir(self.settings, book_id, book)
-    os.execute("rm -rf " .. string.format("%q", cache_dir))
-    if book then
-        books[book_id] = nil
-        self.settings:set("books", books)
-        self.settings:flush()
+    local removed, remove_err = self:removeOwnedBookCache(book_id, book)
+    if not removed then
+        logger.err("book cache cleanup refused:", tostring(book_id),
+            tostring(remove_err))
+        return nil, remove_err
     end
+    books[book_id] = nil
+    self.settings:set("books", books)
+    self.settings:flush()
     if path_to_remove then
         pcall(function()
             local ReadCollection = require("readcollection")
@@ -700,6 +815,7 @@ function M:clearBookCache(book_id)
         end)
     end
     self:refreshShelfCacheIndicators()
+    return true
 end
 
 function M:clearAllMPCache()
@@ -707,57 +823,74 @@ function M:clearAllMPCache()
     -- root) rather than scanning only the current cache_dir, and only touch
     -- plugin-owned entries tracked in the books table.
     local books = self.settings:get("books", {})
+    local cleared, failed = {}, {}
+    for book_id, book in pairs(books) do
+        if WeRead.is_mp_book(book_id) then
+            local removed, remove_err = self:removeOwnedBookCache(book_id, book)
+            if removed then
+                table.insert(cleared, {
+                    book_id = book_id,
+                    path = book.cached_full_book or book.cached_file,
+                })
+            else
+                failed[book_id] = remove_err
+                logger.err("MP cache cleanup refused:", tostring(book_id),
+                    tostring(remove_err))
+            end
+        end
+    end
     pcall(function()
         local ReadCollection = require("readcollection")
         local name = "weread"
-        if not ReadCollection.coll then
-            ReadCollection:_read()
-        end
-        for book_id, book in pairs(books) do
-            if WeRead.is_mp_book(book_id) and book then
-                local path = book.cached_full_book or book.cached_file
-                if path then
-                    ReadCollection:removeItem(path, name, true)
-                end
+        if not ReadCollection.coll then ReadCollection:_read() end
+        for _, entry in ipairs(cleared) do
+            if entry.path then
+                ReadCollection:removeItem(entry.path, name, true)
             end
         end
-        ReadCollection:write({ [name] = true })
+        if #cleared > 0 then ReadCollection:write({ [name] = true }) end
     end)
-    for book_id, book in pairs(books) do
-        if WeRead.is_mp_book(book_id) then
-            os.execute("rm -rf " .. string.format("%q", Content.book_resolved_dir(self.settings, book_id, book)))
-            books[book_id] = nil
-        end
-    end
+    for _, entry in ipairs(cleared) do books[entry.book_id] = nil end
     self.settings:set("books", books)
     self.settings:flush()
     self:refreshShelfCacheIndicators()
+    return next(failed) == nil, failed
 end
 
 function M:clearAllCache()
     local books = self.settings:get("books", {})
+    local cleared, failed = {}, {}
+    for book_id, book in pairs(books) do
+        local removed, remove_err = self:removeOwnedBookCache(book_id, book)
+        if removed then
+            table.insert(cleared, {
+                book_id = book_id,
+                path = book.cached_full_book or book.cached_file,
+            })
+        else
+            failed[book_id] = remove_err
+            logger.err("cache cleanup refused:", tostring(book_id),
+                tostring(remove_err))
+        end
+    end
     pcall(function()
         local ReadCollection = require("readcollection")
         local name = "weread"
         if not ReadCollection.coll then
             ReadCollection:_read()
         end
-        for _id, book in pairs(books) do
-            if book then
-                local path = book.cached_full_book or book.cached_file
-                if path then
-                    ReadCollection:removeItem(path, name, true)
-                end
+        for _, entry in ipairs(cleared) do
+            if entry.path then
+                ReadCollection:removeItem(entry.path, name, true)
             end
         end
-        ReadCollection:write({ [name] = true })
+        if #cleared > 0 then ReadCollection:write({ [name] = true }) end
     end)
-    for book_id, book in pairs(books) do
-        os.execute("rm -rf " .. string.format("%q", Content.book_resolved_dir(self.settings, book_id, book)))
-    end
-    self.settings:set("books", {})
+    for _, entry in ipairs(cleared) do books[entry.book_id] = nil end
+    self.settings:set("books", books)
     self.settings:flush()
     self:refreshShelfCacheIndicators()
+    return next(failed) == nil, failed
 end
 
 return M

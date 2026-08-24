@@ -64,6 +64,49 @@ local function http_error(client, code, text, headers)
     return table.concat(parts, ", ")
 end
 
+local function classify_mp_error(err_code, message, http_code)
+    local numeric_code = tonumber(err_code)
+    if numeric_code == -2041 or numeric_code == -2012
+        or tonumber(http_code) == 401 then
+        return "mp_credentials_expired"
+    end
+    local text = tostring(message or "")
+    local lower = text:lower()
+    if lower:find("captcha", 1, true)
+        or text:find("验证码", 1, true)
+        or text:find("安全验证", 1, true)
+        or text:find("完成验证", 1, true) then
+        return "mp_verification_required"
+    end
+    if lower:find("risk control", 1, true)
+        or lower:find("risk_control", 1, true)
+        or text:find("访问过于频繁", 1, true)
+        or text:find("操作频繁", 1, true)
+        or text:find("请求频繁", 1, true)
+        or text:find("环境异常", 1, true)
+        or text:find("账号异常", 1, true)
+        or tonumber(http_code) == 403 or tonumber(http_code) == 429 then
+        return "mp_risk_controlled"
+    end
+    return nil
+end
+
+Client.classify_mp_error = classify_mp_error
+
+local function classify_mp_content_page(text, http_code)
+    text = tostring(text or "")
+    local title = text:match("<[Tt][Ii][Tt][Ll][Ee][^>]*>(.-)</[Tt][Ii][Tt][Ll][Ee]>")
+    local title_kind = classify_mp_error(nil, title, http_code)
+    if title_kind then return title_kind end
+    local lower = text:lower()
+    if lower:find("captcha", 1, true)
+        and (lower:find("challenge", 1, true)
+            or lower:find("verify", 1, true)) then
+        return "mp_verification_required"
+    end
+    return nil
+end
+
 local function deepcopy(value)
     if type(value) ~= "table" then
         return value
@@ -703,17 +746,34 @@ function Client:get_mp_articles(book_id, max_idx, count, wr_ticket)
     })
 
     if code and code >= 200 and code < 300 then
+        local content_type = tostring(header_value(
+            resp_headers, "content-type") or ""):lower()
+        local looks_like_json = content_type:find("json", 1, true)
+            or tostring(text or ""):match("^%s*{") ~= nil
+            or tostring(text or ""):match("^%s*%[") ~= nil
+        if not looks_like_json then
+            local response_kind = classify_mp_error(nil, text, code)
+            if response_kind then return nil, code, response_kind end
+        end
         local data = self:decode_http_json(text, {
             method = "GET",
             url = url,
             code = code,
             headers = resp_headers,
         })
-        if data.errCode and data.errCode ~= 0 then
-            return nil, data.errCode
+        local response_error_code = data.errCode or data.errcode
+        if response_error_code ~= nil
+            and tonumber(response_error_code) ~= 0 then
+            local response_kind = classify_mp_error(
+                response_error_code,
+                data.errMsg or data.errmsg or data.message or data.msg,
+                code)
+            return nil, response_error_code, response_kind
         end
-        return data, nil
+        return data, nil, nil
     end
+    local response_kind = classify_mp_error(nil, text, code)
+    if response_kind then return nil, code, response_kind end
     error(http_error(self, code, text, resp_headers))
 end
 
@@ -741,6 +801,12 @@ function Client:get_mp_content(review_id, opts)
     })
 
     if code and code >= 200 and code < 300 then
+        -- Verification/risk pages are short HTML documents returned with 200.
+        -- Do not cache them as if they were article content.
+        if #(text or "") <= 256 * 1024 then
+            local response_kind = classify_mp_content_page(text, code)
+            if response_kind then error(response_kind, 0) end
+        end
         return text, {
             code = code,
             content_type = header_value(resp_headers, "content-type"),
@@ -748,6 +814,8 @@ function Client:get_mp_content(review_id, opts)
             url = url,
         }
     end
+    local response_kind = classify_mp_error(nil, text, code)
+    if response_kind then error(response_kind, 0) end
     error(http_error(self, code, text, resp_headers))
 end
 

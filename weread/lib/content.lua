@@ -1,5 +1,6 @@
 local Crypto = require("weread.lib.crypto")
 local BookLayout = require("weread.lib.book_layout")
+local CacheSafety = require("weread.lib.cache_safety")
 local ReaderState = require("weread.lib.reader_state")
 local WeRead = require("weread.lib.protocol")
 local Thoughts = require("weread.lib.thoughts")
@@ -15,6 +16,10 @@ Content.MAX_CHAPTER_IMAGE_BYTES = 64 * 1024 * 1024
 Content.MAX_CHAPTER_IMAGE_COUNT = 4096
 Content.MAX_COVER_IMAGE_BYTES = 16 * 1024 * 1024
 Content.MAX_CHAPTER_SHARD_BYTES = 64 * 1024 * 1024
+Content.MAX_STAGED_CHAPTER_BYTES = 128 * 1024 * 1024
+Content.MAX_CATALOG_CACHE_BYTES = 16 * 1024 * 1024
+
+local MAX_FILENAME_BYTES = 180
 
 local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
@@ -57,7 +62,8 @@ function Content.book_dir_name(book_id)
 end
 
 function Content.book_cache_dir(settings, book_id)
-    return settings.cache_dir .. "/" .. Content.book_dir_name(book_id)
+    local root = tostring(settings.cache_dir or ""):gsub("/+$", "")
+    return root .. "/" .. Content.book_dir_name(book_id)
 end
 
 -- Resolve where a book's files actually live. The current settings.cache_dir may
@@ -106,7 +112,20 @@ function Content.save_catalog_cache(client, settings, book, chapters)
         return false, "missing book id"
     end
     local dir = path:match("^(.*)/[^/]+$")
-    os.execute("mkdir -p " .. string.format("%q", dir))
+    local roots = { settings.cache_dir, settings.default_cache_dir }
+    local valid, validation_error = CacheSafety.validate_owned(
+        dir, book.book_id or book.bookId, {
+            roots = roots,
+            allow_new_child = true,
+            legacy_evidence = CacheSafety.has_legacy_file_evidence(
+                dir, book, { path }),
+        })
+    if not valid then return false, validation_error end
+    local made, make_err = CacheSafety.make_path(dir)
+    if not made then return false, make_err end
+    local book_id = book.book_id or book.bookId
+    local marked, mark_err = CacheSafety.mark(dir, book_id)
+    if not marked then return false, mark_err end
     local ok, encoded = pcall(function()
         return client:json_encode({
             version = 1,
@@ -123,10 +142,10 @@ function Content.save_catalog_cache(client, settings, book, chapters)
         return false, err
     end
     local write_ok, write_err = file:write(encoded)
-    file:close()
-    if not write_ok then
+    local close_ok, close_err = file:close()
+    if not write_ok or not close_ok then
         os.remove(tmp_path)
-        return false, write_err
+        return false, write_err or close_err
     end
     local rename_ok, rename_err = os.rename(tmp_path, path)
     if not rename_ok then
@@ -146,8 +165,26 @@ function Content.load_catalog_cache(client, settings, book)
     if not file then
         return nil
     end
+    local size, size_err = file:seek("end")
+    if not size or size > Content.MAX_CATALOG_CACHE_BYTES then
+        file:close()
+        logger.warn("ignore oversized or unreadable catalog cache:", path,
+            tostring(size_err or size or "unknown size"))
+        return nil
+    end
+    local rewound, rewind_err = file:seek("set", 0)
+    if not rewound then
+        file:close()
+        logger.warn("ignore unreadable catalog cache:", path,
+            tostring(rewind_err or "could not rewind"))
+        return nil
+    end
     local encoded = file:read("*a")
     file:close()
+    if not encoded then
+        logger.warn("ignore unreadable catalog cache:", path)
+        return nil
+    end
     local ok, decoded = pcall(function()
         return client:json_decode(encoded)
     end)
@@ -167,11 +204,28 @@ local function filename_safe(value)
     value = tostring(value or ""):gsub("[%z%c/\\:%*%?\"<>|]", "_")
     value = value:gsub("^%s+", ""):gsub("%s+$", "")
     value = value:gsub("%s+", " ")
+    value = value:gsub("[%.%s]+$", "")
     if value == "" then
         value = "weread"
     end
+    if #value > MAX_FILENAME_BYTES then
+        local digest = Crypto.md5_hex(value):sub(1, 10)
+        local suffix = "-" .. digest
+        local limit = MAX_FILENAME_BYTES - #suffix
+        local cut = limit
+        -- If the next byte is a UTF-8 continuation byte, move the cut before
+        -- that code point so the shortened filename remains valid UTF-8.
+        while cut > 0 do
+            local next_byte = value:byte(cut + 1)
+            if not next_byte or next_byte < 128 or next_byte > 191 then break end
+            cut = cut - 1
+        end
+        value = value:sub(1, cut):gsub("[%.%s]+$", "") .. suffix
+    end
     return value
 end
+
+Content.filename_safe = filename_safe
 
 local function item_id(prefix, value)
     return prefix .. basename_safe(value):gsub("%.", "_")
@@ -349,20 +403,47 @@ local function write_file(path, data)
     if not file then
         error(err)
     end
-    file:write(data)
-    file:close()
+    local wrote, write_err = file:write(data)
+    local closed, close_err = file:close()
+    if not wrote then error(write_err or "file write failed") end
+    if not closed then error(close_err or "file close failed") end
+end
+
+local function write_file_atomic(path, data)
+    local temporary = path .. ".tmp"
+    pcall(os.remove, temporary)
+    local ok, err = pcall(write_file, temporary, data)
+    if not ok then
+        pcall(os.remove, temporary)
+        error(err, 0)
+    end
+    local renamed, rename_err = os.rename(temporary, path)
+    if not renamed then
+        pcall(os.remove, temporary)
+        error(rename_err or "could not commit staged file", 0)
+    end
 end
 
 local function make_path(path)
-    local ok, util = pcall(require, "util")
-    if ok and util and util.makePath then
-        local made, err = util.makePath(path)
-        if not made then error(err or ("could not create directory: " .. path)) end
-        return
+    local made, err = CacheSafety.make_path(path)
+    if not made then error(err or ("could not create directory: " .. path)) end
+end
+
+local function ensure_book_dir(path, book_id, settings, book, extra_paths)
+    local valid, validation_error = CacheSafety.validate_owned(
+        path, book_id, {
+            roots = { settings.cache_dir, settings.default_cache_dir },
+            allow_new_child = true,
+            legacy_evidence = CacheSafety.has_legacy_file_evidence(
+                path, book, extra_paths),
+        })
+    if not valid then
+        error(validation_error or "unsafe WeRead cache directory")
     end
-    local result = os.execute("mkdir -p " .. string.format("%q", path))
-    if result ~= true and result ~= 0 then
-        error("could not create directory: " .. path)
+    make_path(path)
+    local marked, mark_err = CacheSafety.mark(path, book_id)
+    if not marked then
+        error(mark_err or "could not mark WeRead cache directory")
     end
 end
 
@@ -370,6 +451,22 @@ local function remove_tree(path)
     if type(path) ~= "string"
         or not path:match("/%.weread%-download%-%d+%-%d+$") then
         return nil, "refusing to remove an invalid download workspace"
+    end
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs then ok_lfs, lfs = pcall(require, "lfs") end
+    if not ok_lfs or not lfs then
+        return nil, "filesystem inspection unavailable"
+    end
+    local attributes = type(lfs.symlinkattributes) == "function"
+        and lfs.symlinkattributes(path) or lfs.attributes(path)
+    if not attributes then return true end
+    local mode = type(attributes) == "table"
+        and attributes.mode or attributes
+    if mode == "link" then
+        return nil, "refusing to remove a symbolic-link workspace"
+    end
+    if mode ~= "directory" then
+        return nil, "download workspace is not a directory"
     end
     local ok, ffiutil = pcall(require, "ffi/util")
     if not ok or not ffiutil or not ffiutil.purgeDir then
@@ -384,19 +481,84 @@ end
 function Content.create_download_workspace(settings, book)
     local book_id = book.book_id or book.bookId
     local book_dir = Content.book_resolved_dir(settings, book_id, book)
-    make_path(book_dir)
+    ensure_book_dir(book_dir, book_id, settings, book)
     book.cache_dir = book_dir
     local workspace = string.format("%s/.weread-download-%d-%d",
         book_dir, os.time(), math.random(100000, 999999))
     local incoming_dir = workspace .. "/incoming"
     local asset_dir = workspace .. "/images"
+    local body_dir = workspace .. "/bodies"
+    local package_text_dir = workspace .. "/package-text"
     make_path(incoming_dir)
     make_path(asset_dir)
+    make_path(body_dir)
+    make_path(package_text_dir)
     return {
         path = workspace,
         incoming_dir = incoming_dir,
         asset_dir = asset_dir,
+        body_dir = body_dir,
+        package_text_dir = package_text_dir,
     }
+end
+
+function Content.stage_chapter_body(workspace, chapter_index, body)
+    if type(workspace) ~= "table" or type(workspace.body_dir) ~= "string"
+        or type(workspace.package_text_dir) ~= "string" then
+        error("download workspace cannot stage chapter bodies")
+    end
+    body = tostring(body or "")
+    if #body > Content.MAX_STAGED_CHAPTER_BYTES then
+        error("chapter body exceeds staging safety limit")
+    end
+    local index = math.max(1, math.floor(tonumber(chapter_index) or 1))
+    local path = string.format("%s/chapter-%06d.xhtml", workspace.body_dir, index)
+    write_file_atomic(path, body)
+    return {
+        path = path,
+        package_text_dir = workspace.package_text_dir,
+        size = #body,
+    }
+end
+
+function Content.load_chapter_body(source)
+    if type(source) ~= "table" then return tostring(source or "") end
+    local path = source.path
+    if type(path) ~= "string" or path == "" then
+        error("invalid staged chapter body")
+    end
+    local file, open_err = io.open(path, "rb")
+    if not file then error(open_err or "could not open staged chapter body") end
+    local size, size_err = file:seek("end")
+    if not size then
+        file:close()
+        error(size_err or "could not inspect staged chapter body")
+    end
+    if size > Content.MAX_STAGED_CHAPTER_BYTES then
+        file:close()
+        error("staged chapter body exceeds safety limit")
+    end
+    local reset, reset_err = file:seek("set", 0)
+    if not reset then
+        file:close()
+        error(reset_err or "could not rewind staged chapter body")
+    end
+    local body, read_err = file:read("*a")
+    local closed, close_err = file:close()
+    if not body then error(read_err or "could not read staged chapter body") end
+    if not closed then error(close_err or "could not close staged chapter body") end
+    return body
+end
+
+function Content.replace_chapter_body(source, body)
+    if type(source) ~= "table" then return tostring(body or "") end
+    body = tostring(body or "")
+    if #body > Content.MAX_STAGED_CHAPTER_BYTES then
+        error("chapter body exceeds staging safety limit")
+    end
+    write_file_atomic(source.path, body)
+    source.size = #body
+    return source
 end
 
 function Content.cleanup_download_workspace(workspace)
@@ -414,9 +576,40 @@ function Content.cleanup_stale_downloads(settings)
     if not ok_lfs then ok_lfs, lfs = pcall(require, "lfs") end
     if not ok_lfs or not lfs then return 0 end
     local dirs = {}
+    local roots = {
+        settings.cache_dir,
+        settings.default_cache_dir,
+    }
     for book_id, book in pairs(settings:get("books", {}) or {}) do
         local dir = Content.book_resolved_dir(settings, book_id, book)
-        dirs[dir] = true
+        local owned, owner_err = CacheSafety.validate_owned(
+            dir, book_id, {
+                roots = roots,
+                legacy_evidence = CacheSafety.has_legacy_file_evidence(
+                    dir, book),
+            })
+        if owned then
+            dirs[dir] = true
+        else
+            logger.warn("skip stale cleanup for unowned cache:",
+                tostring(dir), tostring(owner_err))
+        end
+    end
+    for _, root in pairs(roots) do
+        if type(root) == "string" and root ~= ""
+            and lfs.attributes(root, "mode") == "directory" then
+            for name in lfs.dir(root) do
+                if name ~= "." and name ~= ".." then
+                    local candidate = root .. "/" .. name
+                    local owner = CacheSafety.read_marker_owner(candidate)
+                    local owned = owner and CacheSafety.validate_owned(
+                        candidate, owner, { roots = roots, lfs = lfs })
+                    if owned then
+                        dirs[candidate] = true
+                    end
+                end
+            end
+        end
     end
     local removed = 0
     for dir in pairs(dirs) do
@@ -426,6 +619,12 @@ function Content.cleanup_stale_downloads(settings)
                     local cleaned = remove_tree(dir .. "/" .. name)
                     if cleaned then removed = removed + 1 end
                 elseif name:match("%.epub%.part$") then
+                    if os.remove(dir .. "/" .. name) then removed = removed + 1 end
+                elseif name:match("%.html%.tmp$")
+                    or name == "catalog.json.tmp"
+                    or name == "metadata.json.tmp"
+                    or name == "reading_state.json.tmp"
+                    or name == "articles.json.tmp" then
                     if os.remove(dir .. "/" .. name) then removed = removed + 1 end
                 elseif name:match("%.epub%.weread%-backup$") then
                     local backup = dir .. "/" .. name
@@ -442,6 +641,22 @@ function Content.cleanup_stale_downloads(settings)
         end
     end
     return removed
+end
+
+function Content.available_disk_bytes(path)
+    if type(path) ~= "string" or path == "" or type(io.popen) ~= "function" then
+        return nil
+    end
+    local pipe = io.popen("df -Pk " .. CacheSafety.shell_quote(path)
+        .. " 2>/dev/null")
+    if not pipe then return nil end
+    local available
+    for line in pipe:lines() do
+        local blocks = line:match("^%S+%s+%d+%s+%d+%s+(%d+)%s+")
+        if blocks then available = tonumber(blocks) * 1024 end
+    end
+    pipe:close()
+    return available
 end
 
 local function commit_file(part_path, path)
@@ -501,7 +716,15 @@ local function write_epub(path, entries)
             end
         end
     end, debug.traceback)
-    pcall(function() archive:close() end)
+    local close_called, close_result = pcall(function()
+        return archive:close()
+    end)
+    if ok and (not close_called or close_result == false or archive.err) then
+        ok = false
+        err = close_called
+            and (archive.err or "failed to close EPUB archive")
+            or close_result
+    end
     if not ok then
         pcall(os.remove, part_path)
         error(err, 0)
@@ -793,7 +1016,7 @@ end
 function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     local book_id = book.book_id or book.bookId
     local dir = Content.book_resolved_dir(settings, book_id, book)
-    os.execute("mkdir -p " .. string.format("%q", dir))
+    ensure_book_dir(dir, book_id, settings, book)
     book.cache_dir = dir
     local layout_mode = BookLayout.mode(settings)
     local layout_chapter = BookLayout.prepare_chapter(
@@ -871,18 +1094,39 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     return path
 end
 
+local function classify_book_sources(chapters, chapter_bodies)
+    local counts = { text = 0, illustrated = 0, image = 0 }
+    local kinds = {}
+    local total = 0
+    for chapter_index, chapter in ipairs(chapters or {}) do
+        local uid = tostring(chapter.chapterUid or chapter_index)
+        local body = Content.load_chapter_body(
+            type(chapter_bodies) == "table" and chapter_bodies[uid] or "")
+        local kind = BookLayout.classify_chapter(body_fragment(body))
+        kinds[uid] = kind
+        counts[kind] = (counts[kind] or 0) + 1
+        total = total + 1
+    end
+    if total > 0 and counts.image * 2 >= total then return "image", kinds end
+    if counts.image > 0 or counts.illustrated > 0 then
+        return "illustrated", kinds
+    end
+    return "text", kinds
+end
+
 function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix,
         assets, css, cover_data, chapter_css_by_uid)
     local book_id = book.book_id or book.bookId
     local dir = Content.book_resolved_dir(settings, book_id, book)
-    os.execute("mkdir -p " .. string.format("%q", dir))
+    ensure_book_dir(dir, book_id, settings, book)
     book.cache_dir = dir
     local book_title = book.title or "WeRead"
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (suffix or "book")) .. ".epub"
     local author = book.author or "WeRead"
     local layout_mode = BookLayout.mode(settings)
     local layout_chapters = BookLayout.prepare_chapters(chapters, layout_mode)
-    local book_kind = BookLayout.classify_book(layout_chapters, chapter_bodies)
+    local book_kind, chapter_kinds = classify_book_sources(
+        layout_chapters, chapter_bodies)
     logger.info("book layout prepared:",
         "mode=", layout_mode, "kind=", book_kind,
         "chapters=", tostring(#layout_chapters))
@@ -926,6 +1170,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
     end
     append_asset_entries(entries, assets)
 
+    local package_text_dir
     for chapter_index, chapter in ipairs(layout_chapters) do
         local uid = tostring(chapter.chapterUid or chapter_index)
         local filename = string.format("text/chapter-%03d.xhtml", chapter_index)
@@ -950,8 +1195,11 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
             chapter_style_link = '<link rel="stylesheet" type="text/css" href="../'
                 .. style_href .. '"/>\n'
         end
+        local body_source = chapter_bodies[uid]
+        local source_body = Content.load_chapter_body(body_source)
         local chapter_body, chapter_kind = BookLayout.prepare_body(
-            body_fragment(chapter_bodies[uid] or ""), chapter, layout_mode)
+            body_fragment(source_body), chapter, layout_mode)
+        chapter_kind = chapter_kinds[uid] or chapter_kind
         local body_classes = BookLayout.body_classes(
             layout_mode, book_kind, chapter_kind)
         local chapter_xhtml = [[<?xml version="1.0" encoding="utf-8"?>
@@ -965,9 +1213,30 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 ]] .. chapter_body .. [[
 </body>
 </html>]]
-        table.insert(entries, { name = "OEBPS/" .. filename, data = chapter_xhtml })
+        if type(body_source) == "table"
+            and type(body_source.package_text_dir) == "string" then
+            if package_text_dir and package_text_dir ~= body_source.package_text_dir then
+                error("staged chapter bodies must share one package directory")
+            end
+            package_text_dir = body_source.package_text_dir
+            local staged_path = package_text_dir .. "/"
+                .. filename:match("[^/]+$")
+            write_file_atomic(staged_path, chapter_xhtml)
+        else
+            table.insert(entries, {
+                name = "OEBPS/" .. filename,
+                data = chapter_xhtml,
+            })
+        end
         table.insert(manifest_items, [[<item id="]] .. id .. [[" href="]] .. filename .. [[" media-type="application/xhtml+xml"/>]])
         table.insert(spine_items, [[<itemref idref="]] .. id .. [["/>]])
+    end
+    if package_text_dir then
+        table.insert(entries, {
+            name = "OEBPS/text",
+            path = package_text_dir,
+            recursive = true,
+        })
     end
 
     local opf = [[<?xml version="1.0" encoding="utf-8"?>
@@ -2083,22 +2352,84 @@ end
 function Content.mp_article_path(settings, book, article)
     local book_id = book.book_id or book.bookId
     local dir = Content.book_resolved_dir(settings, book_id, book)
-    local title = filename_safe(article.title or "article")
-    return dir .. "/" .. title .. ".html"
+    return dir .. "/" .. Content.mp_article_filename(article) .. ".html"
+end
+
+local function article_identity(article)
+    article = type(article) == "table" and article or {}
+    local function identity(label, value)
+        value = tostring(value or "")
+        if value ~= "" and value ~= "0" then
+            return label .. ":" .. value
+        end
+    end
+    for _, candidate in ipairs({
+        { "original", article.originalId },
+        { "review", article.reviewId },
+        { "article", article.articleId },
+        { "id", article.id },
+    }) do
+        local value = identity(candidate[1], candidate[2])
+        if value then return value end
+    end
+    for _, review_id in ipairs(article.reviewIds or {}) do
+        local value = identity("review", review_id)
+        if value then return value end
+    end
+    return identity("source", article.sourceUrl)
+        or identity("created", article.createTime)
+end
+
+local function filename_with_suffix(value, suffix)
+    local base = filename_safe(value)
+    if suffix == "" then return base end
+    local limit = MAX_FILENAME_BYTES - #suffix
+    if #base > limit then
+        local cut = limit
+        while cut > 0 do
+            local next_byte = base:byte(cut + 1)
+            if not next_byte or next_byte < 128 or next_byte > 191 then break end
+            cut = cut - 1
+        end
+        base = base:sub(1, cut):gsub("[%.%s]+$", "")
+    end
+    if base == "" then base = "article" end
+    return base .. suffix
+end
+
+function Content.mp_article_filename(article)
+    local identity = article_identity(article)
+    local suffix = identity and ("-" .. Crypto.md5_hex(identity):sub(1, 10)) or ""
+    return filename_with_suffix(article and article.title or "article", suffix)
+end
+
+function Content.mp_article_legacy_filename(article)
+    return filename_safe(article and article.title or "article")
+end
+
+function Content.mp_article_legacy_path(settings, book, article)
+    local book_id = book.book_id or book.bookId
+    local dir = Content.book_resolved_dir(settings, book_id, book)
+    return dir .. "/" .. Content.mp_article_legacy_filename(article) .. ".html"
 end
 
 function Content.mp_article_cached_path(settings, book, article)
-    local html_path = Content.mp_article_path(settings, book, article)
-    local f = io.open(html_path, "r")
-    if f then
-        f:close()
-        return html_path
+    local candidates, seen = {}, {}
+    local function add(path)
+        if path and not seen[path] then
+            seen[path] = true
+            candidates[#candidates + 1] = path
+            candidates[#candidates + 1] = path:gsub("%.html$", ".epub")
+        end
     end
-    local epub_path = html_path:gsub("%.html$", ".epub")
-    f = io.open(epub_path, "r")
-    if f then
-        f:close()
-        return epub_path
+    add(Content.mp_article_path(settings, book, article))
+    add(Content.mp_article_legacy_path(settings, book, article))
+    for _, path in ipairs(candidates) do
+        local f = io.open(path, "rb")
+        if f then
+            f:close()
+            return path
+        end
     end
     return nil
 end
@@ -2109,9 +2440,25 @@ function Content.save_mp_article_html(settings, book, article, body_html)
     -- Pin the real directory on the record so later lookups, moves and cleanup
     -- can find these files after the download directory changes.
     book.cache_dir = dir
-    os.execute("mkdir -p " .. string.format("%q", dir))
     local title = article.title or "Article"
     local path = Content.mp_article_path(settings, book, article)
+    local old_path = Content.mp_article_legacy_path(settings, book, article)
+    local legacy_paths = {
+        path,
+        path:gsub("%.html$", ".epub"),
+        old_path,
+        old_path:gsub("%.html$", ".epub"),
+    }
+    for _, known_article in ipairs(book.mp_articles or {}) do
+        local known_path = Content.mp_article_path(settings, book, known_article)
+        local known_old_path = Content.mp_article_legacy_path(
+            settings, book, known_article)
+        table.insert(legacy_paths, known_path)
+        table.insert(legacy_paths, known_path:gsub("%.html$", ".epub"))
+        table.insert(legacy_paths, known_old_path)
+        table.insert(legacy_paths, known_old_path:gsub("%.html$", ".epub"))
+    end
+    ensure_book_dir(dir, book_id, settings, book, legacy_paths)
     body_html = BookLayout.sanitize_body(body_html)
     body_html = strip_mp_reader_font_styles(body_html)
     body_html = strip_blank_mp_blocks(body_html)
@@ -2167,7 +2514,7 @@ p {
 </body>
 </html>]]
 
-    write_file(path, html)
+    write_file_atomic(path, html)
     return path
 end
 
@@ -2180,6 +2527,7 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
     local referer = book_id and book_id ~= "" and WeRead.mp_reader_url(book_id) or "https://weread.qq.com/"
     local candidate_ids = {}
     local seen_ids = {}
+    local access_error
     local function add_candidate(review_id)
         review_id = tostring(review_id or "")
         if review_id ~= "" and not seen_ids[review_id] then
@@ -2218,13 +2566,21 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
                 meta = meta or candidate_meta
             else
                 table.insert(attempts, prefix .. tostring(candidate_index) .. ":error")
+                local candidate_error = tostring(candidate_html or "")
+                if candidate_error:find("mp_verification_required", 1, true)
+                    or candidate_error:find("mp_risk_controlled", 1, true)
+                    or candidate_error:find("mp_credentials_expired", 1, true) then
+                    access_error = candidate_error:match(
+                        "(mp_[%a_]+)") or candidate_error
+                end
             end
         end
         return false
     end
 
     fetch_candidates("")
-    if not html or html:match("^%s*$") then
+    if (not html or html:match("^%s*$"))
+        and (not access_error or access_error == "mp_credentials_expired") then
         logger.info("MP content empty, renewing cookie before retry")
         local renew_ok = pcall(function()
             return client:renew_cookie()
@@ -2236,7 +2592,8 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
     end
 
     local source_url = tostring(article.sourceUrl or "")
-    if (not html or html:match("^%s*$")) and source_url:match("^https?://mp%.weixin%.qq%.com/") then
+    if (not html or html:match("^%s*$")) and not access_error
+        and source_url:match("^https?://mp%.weixin%.qq%.com/") then
         local ok, source_html, source_meta = pcall(function()
             return client:get_public_text(source_url)
         end)
@@ -2250,6 +2607,7 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
     end
     local body = Content.extract_mp_body(html)
     if not body then
+        if access_error then error(access_error, 0) end
         local empty_response = not html or html:match("^%s*$") ~= nil
         logger.warn(
             "could not extract MP article body:",

@@ -108,6 +108,13 @@ local function ensure_dir(path)
     end
 end
 
+local function normalize_download_dir(path)
+    if type(path) == "string" and path ~= "/" then
+        return path:gsub("/+$", "")
+    end
+    return path
+end
+
 local function clear_auth_store(store)
     store:saveSetting("api_key", "")
     store:saveSetting("cookies", {})
@@ -126,7 +133,8 @@ function Settings:new()
     }
     obj.store = LuaSettings:open(obj.settings_file)
     -- cache_dir is the download root; defaults to <data_dir>/cache unless overridden.
-    local download_dir = obj.store:readSetting("download_dir", "")
+    local download_dir = normalize_download_dir(
+        obj.store:readSetting("download_dir", ""))
     obj.cache_dir = (type(download_dir) == "string" and download_dir ~= "") and download_dir or obj.default_cache_dir
     ensure_dir(obj.cache_dir)
     local cache = obj.store:readSetting("cache", deepcopy(defaults.cache))
@@ -270,7 +278,12 @@ function Settings:set(key, value)
     if key == "books" and type(value) == "table" then
         local indexes = {}
         for book_id, book in pairs(value) do
-            local ok, index_or_err = BookStore.save(self, book_id, book)
+            local ok, index_or_err = BookStore.save(self, book_id, book, {
+                -- Corrupted/user-edited paths must remain represented so a
+                -- partial cache cleanup cannot drop their records, but saving
+                -- settings must never write metadata into those directories.
+                preserve_unowned_index = true,
+            })
             if not ok then
                 error("Could not save book data: " .. tostring(index_or_err))
             end
@@ -357,6 +370,7 @@ end
 
 -- Pass nil or "" to reset to the default download directory.
 function Settings:set_download_dir(path)
+    path = normalize_download_dir(path)
     if type(path) ~= "string" or path == "" then
         self:set("download_dir", "")
         self.cache_dir = self.default_cache_dir

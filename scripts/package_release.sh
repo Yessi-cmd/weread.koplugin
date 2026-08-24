@@ -4,6 +4,8 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
+bash scripts/check_release_metadata.sh
+
 version="$(
     sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
         _meta.lua | head -n 1

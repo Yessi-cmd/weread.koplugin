@@ -32,7 +32,7 @@
 - [ ] 已在 KOReader 中手动测试
 - [ ] 已运行 `bash scripts/run_lua_specs.sh`
 - [ ] 已运行 `bash scripts/check_lua_namespace.sh`
-- [ ] 已运行 `luacheck main.lua _meta.lua weread spec`
+- [ ] 已运行 `luacheck main.lua _meta.lua weread integrations spec`
 - [ ] 如涉及插件加载/KOReader 兼容性，已运行或触发 `KOReader integration`
 - [ ] 不适用，仅文档或注释变更
 

@@ -170,7 +170,7 @@ local function compact_text(value)
 end
 
 local function utf8_length(value)
-    local _clean, continuation_bytes = tostring(value or ""):gsub("[\128-\191]", "")
+    local _, continuation_bytes = tostring(value or ""):gsub("[\128-\191]", "")
     return #tostring(value or "") - continuation_bytes
 end
 

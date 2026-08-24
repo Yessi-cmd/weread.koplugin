@@ -11,6 +11,10 @@ Updater.__index = Updater
 
 Updater.AUTO_CHECK_INTERVAL = 24 * 60 * 60
 Updater.MAX_PACKAGE_BYTES = 10 * 1024 * 1024
+Updater.MAX_RELEASE_METADATA_BYTES = 1024 * 1024
+Updater.MAX_CHECKSUM_BYTES = 4096
+Updater.MAX_UNPACKED_BYTES = 64 * 1024 * 1024
+Updater.MAX_ARCHIVE_ENTRIES = 4096
 Updater.API_URL = "https://api.github.com/repos/finlater/weread.koplugin/releases/latest"
 Updater.RELEASE_PREFIX = "https://github.com/finlater/weread.koplugin/releases/download/"
 Updater.GITHUB_MIRRORS = {
@@ -18,6 +22,24 @@ Updater.GITHUB_MIRRORS = {
     "https://ghfast.top/",
     "https://ghproxy.net/",
 }
+
+local function repository_urls(repository)
+    repository = tostring(repository or "")
+    local owner, name = repository:match("^([%w_.-]+)/([%w_.-]+)$")
+    if not owner or owner == "." or owner == ".."
+        or name == "." or name == ".." then
+        return nil, "invalid update repository"
+    end
+    return {
+        repository = repository,
+        api_url = "https://api.github.com/repos/" .. repository
+            .. "/releases/latest",
+        release_prefix = "https://github.com/" .. repository
+            .. "/releases/download/",
+    }
+end
+
+Updater.repository_urls = repository_urls
 
 local function plugin_dir_from_source()
     local source = debug.getinfo(1, "S").source or ""
@@ -57,25 +79,115 @@ local function remove_file(path)
     if path then pcall(os.remove, path) end
 end
 
+local function safe_absolute_path(path)
+    if type(path) ~= "string" or path == "" or path == "/"
+        or path:sub(1, 1) ~= "/" or path:find("%z") then
+        return false
+    end
+    for component in path:gmatch("[^/]+") do
+        if component == "." or component == ".." then return false end
+    end
+    return true
+end
+
+local function path_mode(path)
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok or not lfs then return nil, "filesystem inspection unavailable" end
+    local inspect = type(lfs.symlinkattributes) == "function"
+        and lfs.symlinkattributes or lfs.attributes
+    if type(inspect) ~= "function" then
+        return nil, "filesystem inspection unavailable"
+    end
+    local called, attributes = pcall(inspect, path)
+    if not called then return nil, attributes end
+    return type(attributes) == "table" and attributes.mode or attributes
+end
+
 local function remove_tree(path)
-    if not path or path == "" then return nil, "invalid directory" end
+    if not safe_absolute_path(path) then return nil, "invalid directory" end
+    local mode, mode_err = path_mode(path)
+    if mode_err then return nil, mode_err end
+    if not mode then return true end
+    if mode == "link" then return nil, "refusing to remove a symbolic link" end
+    if mode ~= "directory" then return nil, "cleanup target is not a directory" end
     local ok, ffiutil = pcall(require, "ffi/util")
     if ok and ffiutil and ffiutil.purgeDir then
-        local removed, err = pcall(ffiutil.purgeDir, path)
-        if removed then return true end
-        return nil, err
+        local called, removed, err = pcall(ffiutil.purgeDir, path)
+        if not called then return nil, removed end
+        if removed == false then
+            return nil, err or "directory cleanup failed"
+        end
+        return true
     end
     return nil, "directory cleanup unavailable"
 end
 
 local function make_path(path)
+    if not safe_absolute_path(path) then return nil, "invalid directory" end
+    local mode, mode_err = path_mode(path)
+    if mode_err then return nil, mode_err end
+    if mode == "link" then return nil, "refusing to use a symbolic link" end
+    if mode then
+        if mode == "directory" then return true end
+        return nil, "path is not a directory"
+    end
     local ok, util = pcall(require, "util")
     if ok and util and util.makePath then
-        return util.makePath(path)
+        local called, made, make_err = pcall(util.makePath, path)
+        if not called then return nil, made end
+        if made == false then return nil, make_err or "could not create directory" end
+        return true
     end
     local lfs = require("libs/libkoreader-lfs")
-    if lfs.attributes(path, "mode") == "directory" then return true end
     return lfs.mkdir(path)
+end
+
+local function clear_tree(path, label)
+    local mode, mode_err = path_mode(path)
+    if mode_err then return nil, mode_err end
+    if not mode then return true end
+    if mode == "link" then
+        return nil, "refusing to clean symbolic-link " .. tostring(label)
+    end
+    if mode ~= "directory" then
+        return nil, tostring(label) .. " is not a directory"
+    end
+    local removed, remove_err = remove_tree(path)
+    if not removed then return nil, remove_err end
+    local remaining, inspect_err = path_mode(path)
+    if inspect_err then return nil, inspect_err end
+    if remaining then
+        return nil, tostring(label) .. " cleanup was incomplete"
+    end
+    return true
+end
+
+function Updater.is_safe_archive_entry(entry)
+    if type(entry) ~= "table" then return false end
+    local path = entry.path
+    local mode = entry.mode
+    if type(path) ~= "string" or path == ""
+        or path:sub(1, 1) == "/" or path:find("%z")
+        or path:find("\\", 1, true) or path:find("//", 1, true)
+        or path:match("^weread%.koplugin/") == nil
+        or (mode ~= "file" and mode ~= "directory") then
+        return false
+    end
+    for component in path:gmatch("[^/]+") do
+        if component == "." or component == ".." then return false end
+    end
+    for _, key in ipairs({ "linkpath", "linkname", "hardlink", "symlink" }) do
+        local value = entry[key]
+        if value ~= nil and value ~= false and value ~= "" then return false end
+    end
+    if mode == "file" then
+        local size = tonumber(entry.size)
+        if not size or size < 0 or size ~= size
+            or size > Updater.MAX_UNPACKED_BYTES then
+            return false
+        end
+    end
+    return true
 end
 
 local function unpack_release(archive, stage)
@@ -86,19 +198,30 @@ local function unpack_release(archive, stage)
         return nil, reader.err or "could not open release archive"
     end
     local ok, err = true, nil
+    local entry_count, unpacked_bytes = 0, 0
+    local seen_paths = {}
     for entry in reader:iterate() do
         local path = entry.path
-        local safe = type(path) == "string"
-            and path ~= ""
-            and path:sub(1, 1) ~= "/"
-            and path:find("\\", 1, true) == nil
-            and path:match("^weread%.koplugin/") ~= nil
-            and path:match("^%.%./") == nil
-            and path:match("/%.%./") == nil
-            and path:match("/%.%.$") == nil
-        if not safe then
-            ok, err = nil, "unsafe path in release archive"
+        entry_count = entry_count + 1
+        if not Updater.is_safe_archive_entry(entry) then
+            ok, err = nil, "unsafe entry in release archive"
             break
+        end
+        if entry_count > Updater.MAX_ARCHIVE_ENTRIES then
+            ok, err = nil, "release archive contains too many entries"
+            break
+        end
+        if seen_paths[path] then
+            ok, err = nil, "release archive contains duplicate paths"
+            break
+        end
+        seen_paths[path] = true
+        if entry.mode == "file" then
+            unpacked_bytes = unpacked_bytes + tonumber(entry.size)
+            if unpacked_bytes > Updater.MAX_UNPACKED_BYTES then
+                ok, err = nil, "release archive expands beyond the size limit"
+                break
+            end
         end
         if not reader:extractToPath(path, stage .. "/" .. path) then
             ok, err = nil, reader.err or "archive extraction failed"
@@ -137,10 +260,13 @@ function Updater.compare_versions(left, right)
     return 0
 end
 
-function Updater.candidate_urls(url, prefer_proxy)
-    local is_allowed = url == Updater.API_URL
+function Updater.candidate_urls(url, prefer_proxy, source)
+    source = source or {}
+    local api_url = source.api_url or Updater.API_URL
+    local release_prefix = source.release_prefix or Updater.RELEASE_PREFIX
+    local is_allowed = url == api_url
         or (type(url) == "string"
-            and url:sub(1, #Updater.RELEASE_PREFIX) == Updater.RELEASE_PREFIX)
+            and url:sub(1, #release_prefix) == release_prefix)
     if not is_allowed then return {} end
     local direct, proxies = { url }, {}
     for _, prefix in ipairs(Updater.GITHUB_MIRRORS) do
@@ -154,7 +280,9 @@ function Updater.candidate_urls(url, prefer_proxy)
     return out
 end
 
-function Updater.parse_release(data)
+function Updater.parse_release(data, source)
+    source = source or {}
+    local release_prefix = source.release_prefix or Updater.RELEASE_PREFIX
     if type(data) ~= "table" or data.draft == true or data.prerelease == true then
         return nil, "invalid release metadata"
     end
@@ -175,30 +303,40 @@ function Updater.parse_release(data)
     end
     local function valid_url(url)
         return type(url) == "string"
-            and url:sub(1, #Updater.RELEASE_PREFIX) == Updater.RELEASE_PREFIX
+            and url:sub(1, #release_prefix) == release_prefix
     end
     if not valid_url(archive_url) or not valid_url(checksum_url) then
         return nil, "release package or checksum is missing"
     end
-    if archive_size and archive_size > Updater.MAX_PACKAGE_BYTES then
+    if archive_size and (archive_size < 0
+        or archive_size > Updater.MAX_PACKAGE_BYTES) then
         return nil, "release package is too large"
     end
+    local release_page_prefix = release_prefix:gsub("/download/$", "/tag/")
     return {
         version = version,
         archive_url = archive_url,
         checksum_url = checksum_url,
         archive_size = archive_size,
         notes = normalize_notes(data.body),
-        release_url = data.html_url,
+        -- Construct the page URL from the trusted repository instead of
+        -- accepting an arbitrary link supplied by mirrored metadata.
+        release_url = release_page_prefix .. "v" .. version,
     }
 end
 
 function Updater:new(options)
     options = options or {}
+    local repository = options.repository or "finlater/weread.koplugin"
+    local source, source_err = repository_urls(repository)
+    assert(source, source_err)
     local obj = {
         settings = assert(options.settings, "settings required"),
         current_version = assert(options.current_version, "current_version required"),
         plugin_dir = options.plugin_dir or plugin_dir_from_source(),
+        repository = source.repository,
+        api_url = source.api_url,
+        release_prefix = source.release_prefix,
     }
     assert(obj.plugin_dir and obj.plugin_dir ~= "", "plugin directory unavailable")
     return setmetatable(obj, self)
@@ -216,8 +354,24 @@ function Updater:_save_state(values)
 end
 
 function Updater:has_update()
-    local latest = self:_state().available_version
+    local state = self:_state()
+    if not self:_state_matches_repository(state) then return false end
+    local latest = state.available_version
     return Updater.compare_versions(latest, self.current_version) == 1
+end
+
+function Updater:_state_matches_repository(state)
+    state = state or self:_state()
+    local state_repository = tostring(state.repository or "")
+    return state_repository == self.repository
+        or (state_repository == ""
+            and self.repository == "finlater/weread.koplugin")
+end
+
+function Updater:last_check_time()
+    local state = self:_state()
+    if not self:_state_matches_repository(state) then return 0 end
+    return tonumber(state.last_check) or 0
 end
 
 function Updater:available_version()
@@ -226,47 +380,102 @@ end
 
 function Updater:_http_get(url, destination, on_download, total_hint, max_bytes)
     local http = require("socket/http")
-    local ltn12 = require("ltn12")
     local socket = require("socket")
     local socketutil = require("socketutil")
-    local sink, chunks, file, limit_error
+    local sink, chunks, file, limit_error, transfer_error
+    local received = 0
+    local function close_destination()
+        if not file then return true end
+        local target = file
+        file = nil
+        local called, closed, close_err = pcall(target.close, target)
+        if not called then return nil, closed end
+        if not closed then return nil, close_err or "could not close download file" end
+        return true
+    end
     if destination then
         file = io.open(destination, "wb")
         if not file then return nil, "cannot create download file" end
-        local file_sink = ltn12.sink.file(file)
-        local received = 0
         sink = function(chunk, err)
             if chunk then
                 if max_bytes and received + #chunk > max_bytes then
                     limit_error = "download exceeds size limit"
-                    file_sink(nil, limit_error)
                     return nil, limit_error
+                end
+                local wrote, write_err = file:write(chunk)
+                if not wrote then
+                    transfer_error = write_err or "download write failed"
+                    return nil, transfer_error
                 end
                 received = received + #chunk
                 if on_download then on_download(received, total_hint) end
+                return 1
             end
-            return file_sink(chunk, err)
+            if err then transfer_error = err end
+            local closed, close_err = close_destination()
+            if not closed then
+                transfer_error = close_err
+                return nil, close_err
+            end
+            return 1
         end
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
     else
         chunks = {}
-        sink = ltn12.sink.table(chunks)
-        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+        sink = function(chunk, err)
+            if chunk then
+                if max_bytes and received + #chunk > max_bytes then
+                    limit_error = "download exceeds size limit"
+                    return nil, limit_error
+                end
+                received = received + #chunk
+                chunks[#chunks + 1] = chunk
+            elseif err then
+                transfer_error = err
+            end
+            return 1
+        end
     end
-    local code, headers, status = socket.skip(1, http.request{
-        url = url,
-        method = "GET",
-        headers = {
-            ["User-Agent"] = "KOReader-WeRead-Updater/1.0",
-            ["Accept"] = "application/vnd.github+json",
-        },
-        sink = sink,
-        redirect = true,
-    })
-    socketutil:reset_timeout()
-    if limit_error then
+    local block_timeout = destination and socketutil.FILE_BLOCK_TIMEOUT
+        or socketutil.LARGE_BLOCK_TIMEOUT
+    local total_timeout = destination and socketutil.FILE_TOTAL_TIMEOUT
+        or socketutil.LARGE_TOTAL_TIMEOUT
+    local timeout_ok, timeout_err = pcall(function()
+        socketutil:set_timeout(block_timeout, total_timeout)
+    end)
+    if not timeout_ok then
+        close_destination()
+        if destination then remove_file(destination) end
+        return nil, "could not configure download timeout: " .. tostring(timeout_err)
+    end
+    local request_ok, code, headers, status = pcall(function()
+        return socket.skip(1, http.request{
+            url = url,
+            method = "GET",
+            headers = {
+                ["User-Agent"] = "KOReader-WeRead-Updater/1.0",
+                ["Accept"] = "application/vnd.github+json",
+            },
+            sink = sink,
+            redirect = true,
+        })
+    end)
+    local reset_ok, reset_err = pcall(function() socketutil:reset_timeout() end)
+    local closed, close_err = close_destination()
+    if limit_error or transfer_error then
         remove_file(destination)
-        return nil, limit_error
+        return nil, limit_error or transfer_error
+    end
+    if not request_ok then
+        if destination then remove_file(destination) end
+        return nil, "HTTP request failed: " .. tostring(code)
+    end
+    if not reset_ok then
+        if destination then remove_file(destination) end
+        return nil, "could not reset download timeout: " .. tostring(reset_err)
+    end
+    if not closed then
+        if destination then remove_file(destination) end
+        return nil, close_err
     end
     if headers == nil or code ~= 200 then
         if destination then remove_file(destination) end
@@ -275,8 +484,15 @@ function Updater:_http_get(url, destination, on_download, total_hint, max_bytes)
     return destination and true or table.concat(chunks)
 end
 
+function Updater:_http_get_direct(url, destination, on_download, total_hint, max_bytes)
+    local candidates = Updater.candidate_urls(url, false, self)
+    if candidates[1] ~= url then return nil, "update URL is not allowed" end
+    return self:_http_get(url, destination, on_download, total_hint, max_bytes)
+end
+
 function Updater:_http_get_with_mirrors(url, destination, on_download, total_hint, max_bytes)
-    local candidates = Updater.candidate_urls(url, self:_state().prefer_proxy == true)
+    local candidates = Updater.candidate_urls(
+        url, self:_state().prefer_proxy == true, self)
     if #candidates == 0 then return nil, "update URL is not allowed" end
     local last_error
     for index, candidate in ipairs(candidates) do
@@ -297,13 +513,14 @@ function Updater:_http_get_with_mirrors(url, destination, on_download, total_hin
 end
 
 function Updater:fetch_release()
-    local body, err = self:_http_get_with_mirrors(Updater.API_URL)
+    local body, err = self:_http_get_with_mirrors(
+        self.api_url, nil, nil, nil, Updater.MAX_RELEASE_METADATA_BYTES)
     if not body then return nil, err end
     local ok_json, json = pcall(require, "json")
     if not ok_json then return nil, "JSON support unavailable" end
     local ok, data = pcall(json.decode, body)
     if not ok then return nil, "invalid GitHub response" end
-    return Updater.parse_release(data)
+    return Updater.parse_release(data, self)
 end
 
 function Updater:cache_release(release)
@@ -315,6 +532,7 @@ function Updater:cache_release(release)
         archive_size = release.archive_size or 0,
         release_notes = release.notes or "",
         release_url = release.release_url or "",
+        repository = self.repository,
     }
 end
 
@@ -370,16 +588,36 @@ function Updater:install_release(release, on_progress)
     end
     report("preparing", 0)
     local data_dir = self.settings.data_dir
+    if type(release) ~= "table"
+        or Updater.compare_versions(release.version, release.version) == nil then
+        return nil, "invalid release metadata"
+    end
+    if not safe_absolute_path(data_dir) or not safe_absolute_path(self.plugin_dir) then
+        return nil, "invalid update installation path"
+    end
+    local plugin_mode, plugin_mode_err = path_mode(self.plugin_dir)
+    if plugin_mode_err then return nil, plugin_mode_err end
+    if plugin_mode ~= "directory" then
+        return nil, plugin_mode == "link" and "plugin directory is a symbolic link"
+            or "plugin directory is unavailable"
+    end
     local archive = data_dir .. "/weread-update.zip"
     local checksum = archive .. ".sha256"
     local stage = data_dir .. "/update-stage"
     remove_file(archive)
     remove_file(checksum)
-    remove_tree(stage)
+    local cleared, clear_err = clear_tree(stage, "staging directory")
+    if not cleared then
+        return nil, "cannot reset staging directory: " .. tostring(clear_err)
+    end
     local made, make_err = make_path(stage)
     if not made then return nil, "cannot create staging directory: " .. tostring(make_err) end
 
     local archive_size = tonumber(release.archive_size) or 0
+    if archive_size < 0 or archive_size > Updater.MAX_PACKAGE_BYTES then
+        remove_tree(stage)
+        return nil, "release package size is invalid"
+    end
     local ok, err = self:_http_get_with_mirrors(
         release.archive_url, archive, function(received, total)
             local ratio = total and total > 0 and math.min(1, received / total) or 0
@@ -387,13 +625,16 @@ function Updater:install_release(release, on_progress)
         end, archive_size, Updater.MAX_PACKAGE_BYTES)
     if not ok then remove_tree(stage); return nil, err end
     report("checksum", 76)
-    local checksum_ok, checksum_err = self:_http_get_with_mirrors(release.checksum_url, checksum)
+    -- The package may use a configured mirror, but its signed digest must come
+    -- from the canonical GitHub URL. Otherwise one proxy could replace both.
+    local checksum_ok, checksum_err = self:_http_get_direct(
+        release.checksum_url, checksum, nil, nil, Updater.MAX_CHECKSUM_BYTES)
     if not checksum_ok then
         remove_file(archive); remove_tree(stage)
         return nil, checksum_err
     end
     local package, package_err = read_file(archive, Updater.MAX_PACKAGE_BYTES)
-    local checksum_body = read_file(checksum, 4096)
+    local checksum_body = read_file(checksum, Updater.MAX_CHECKSUM_BYTES)
     if not package or not checksum_body then
         remove_file(archive); remove_file(checksum); remove_tree(stage)
         return nil, package_err or "invalid checksum file"
@@ -421,13 +662,21 @@ function Updater:install_release(release, on_progress)
 
     report("installing", 97)
     local backup = self.plugin_dir .. ".backup"
-    remove_tree(backup)
+    local backup_cleared, backup_clear_err = clear_tree(backup, "update backup")
+    if not backup_cleared then
+        remove_tree(stage)
+        return nil, "cannot reset update backup: " .. tostring(backup_clear_err)
+    end
     local moved_old, move_old_err = os.rename(self.plugin_dir, backup)
     if not moved_old then remove_tree(stage); return nil, move_old_err or "could not back up plugin" end
     local moved_new, move_new_err = os.rename(staged_plugin, self.plugin_dir)
     if not moved_new then
-        os.rename(backup, self.plugin_dir)
+        local restored, restore_err = os.rename(backup, self.plugin_dir)
         remove_tree(stage)
+        if not restored then
+            return nil, "could not activate update and rollback failed: "
+                .. tostring(restore_err or move_new_err)
+        end
         return nil, move_new_err or "could not activate update"
     end
     remove_tree(stage)

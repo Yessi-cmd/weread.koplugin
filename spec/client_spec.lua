@@ -331,6 +331,70 @@ ok_review, _, err_review = review_client:get_review_comments("r3")
 expect(not ok_review and err_review == "empty response",
     "review comments did not reject an empty body")
 
+local mp_client = Client:new(settings)
+mp_client.json_decode = function(_self, _text)
+    return { errCode = -2041, errMsg = "credential expired" }
+end
+responses[#responses + 1] = {
+    body = '{"errCode":-2041}',
+    code = 200,
+    headers = { ["content-type"] = "application/json" },
+}
+local mp_result, mp_code, mp_kind = mp_client:get_mp_articles("MP_WXS_1")
+expect(mp_result == nil and mp_code == -2041
+        and mp_kind == "mp_credentials_expired",
+    "public-account credential failure was not classified")
+
+mp_client.json_decode = function(_self, _text)
+    return { errCode = "0", items = {} }
+end
+responses[#responses + 1] = {
+    body = '{"errCode":"0","items":[]}',
+    code = 200,
+    headers = { ["content-type"] = "application/json" },
+}
+mp_result, mp_code, mp_kind = mp_client:get_mp_articles("MP_WXS_1")
+expect(type(mp_result) == "table" and mp_code == nil and mp_kind == nil,
+    "string zero public-account status was treated as an error")
+
+responses[#responses + 1] = {
+    body = "<html><title>安全验证</title><body>请完成验证码</body></html>",
+    code = 200,
+    headers = { ["content-type"] = "text/html" },
+}
+mp_result, mp_code, mp_kind = mp_client:get_mp_articles("MP_WXS_1")
+expect(mp_result == nil and mp_code == 200
+        and mp_kind == "mp_verification_required",
+    "public-account verification page was not classified")
+
+responses[#responses + 1] = {
+    body = "too many requests",
+    code = 429,
+    headers = { ["content-type"] = "text/plain" },
+}
+mp_result, mp_code, mp_kind = mp_client:get_mp_articles("MP_WXS_1")
+expect(mp_result == nil and mp_code == 429
+        and mp_kind == "mp_risk_controlled",
+    "public-account rate limit was not classified")
+
+responses[#responses + 1] = {
+    body = "<html><title>环境异常</title></html>",
+    code = 200,
+    headers = { ["content-type"] = "text/html" },
+}
+ok, err = pcall(function() mp_client:get_mp_content("review-1") end)
+expect(not ok and tostring(err):find("mp_risk_controlled", 1, true),
+    "public-account content risk page was accepted as an article")
+
+responses[#responses + 1] = {
+    body = "<html><title>Article</title><body>How CAPTCHA works</body></html>",
+    code = 200,
+    headers = { ["content-type"] = "text/html" },
+}
+local normal_mp_html = mp_client:get_mp_content("review-2")
+expect(normal_mp_html:find("How CAPTCHA works", 1, true),
+    "a normal article mentioning CAPTCHA was misclassified")
+
 local download_path = os.tmpname()
 os.remove(download_path)
 responses[#responses + 1] = {

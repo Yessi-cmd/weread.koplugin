@@ -167,8 +167,8 @@ expect(values.account.name == "new-user" and settings:is_api_configured(),
 expect(settings:is_cookie_configured(),
     "modern wr_gid login cookie was not recognized")
 
-expect(settings:set_download_dir("/external/books") == "/external/books",
-    "custom download directory was not selected")
+expect(settings:set_download_dir("/external/books///") == "/external/books",
+    "custom download directory was not selected or normalized")
 expect(values.download_dir == "/external/books",
     "custom download directory was not persisted")
 expect(settings:set_download_dir("") == "/data/weread/cache",

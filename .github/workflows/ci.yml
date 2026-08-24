@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
@@ -25,15 +26,17 @@ jobs:
         run: bash scripts/check_lua_namespace.sh
 
       - name: Lua static analysis
-        run: luacheck main.lua _meta.lua weread spec
+        run: luacheck main.lua _meta.lua weread integrations spec
 
       - name: Lua syntax check
         run: |
-          find . -name '*.lua' \
-            -not -path './.git/*' \
-            -print0 | while IFS= read -r -d '' file; do
-              luajit -b "$file" /tmp/luajit-check.out
-            done
+          syntax_status=0
+          while IFS= read -r -d '' file; do
+            if ! luajit -b "$file" /tmp/luajit-check.out; then
+              syntax_status=1
+            fi
+          done < <(find . -name '*.lua' -not -path './.git/*' -print0)
+          exit "$syntax_status"
 
       - name: Lua unit and component specs
         run: bash scripts/run_lua_specs.sh
@@ -48,13 +51,10 @@ jobs:
         run: bash scripts/package_release.sh /tmp/weread.koplugin-release-test.zip
 
       - name: Release changelog check
-        run: |
-          version="$(
-            sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
-              _meta.lua | head -n 1
-          )"
-          bash scripts/extract_release_notes.sh "$version" /tmp/release-preface.md
-          grep -qx '## 新功能与改进' /tmp/release-preface.md
+        run: bash scripts/check_release_metadata.sh
+
+      - name: Release decision tests
+        run: bash scripts/test_release_decision.sh
 
       - name: Sensitive information scan
         run: |

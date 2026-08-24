@@ -748,8 +748,11 @@ function M:showWereadCollection()
 end
 
 function M:showAbout()
+    local project_url = self.update_repository
+        and ("https://github.com/" .. self.update_repository)
+        or "https://github.com/finlater/weread.koplugin"
     UIManager:show(InfoMessage:new{
-        text = T(_("weread-yessi Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\nhttps://github.com/finlater/weread.koplugin"), self.version),
+        text = T(_("weread-yessi Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\n%2"), self.version, project_url),
     })
 end
 
@@ -779,7 +782,7 @@ function M:getAboutMenuItems()
 end
 
 function M:getUpdateMenuItems()
-    if self.private_build then
+    if self.private_build and not self.private_updates_enabled then
         return {{
             text = _("Private edition · Manual updates only"),
             keep_menu_open = true,
@@ -787,6 +790,14 @@ function M:getUpdateMenuItems()
         }}
     end
     local items = {}
+    if self.private_build then
+        table.insert(items, {
+            text = T(_("Private edition · Updates from %1"),
+                self.update_repository or "custom repository"),
+            keep_menu_open = true,
+            enabled_func = function() return false end,
+        })
+    end
     local available = self.updater:available_version()
     if available then
         table.insert(items, {

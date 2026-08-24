@@ -35,6 +35,9 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
+      - name: Verify release metadata
+        run: bash scripts/check_release_metadata.sh
+
       - name: Read plugin version
         id: version
         env:
@@ -59,9 +62,7 @@ jobs:
           tag="v$current"
           package_label="$tag"
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
-            if ! git rev-parse --verify --quiet "refs/tags/$tag"; then
-              automatic_release=true
-            fi
+            automatic_release="$(bash scripts/should_auto_release.sh "$current")"
           else
             package_label="${MANUAL_LABEL:-${TARGET_SHA:0:8}}"
             if [[ ! "$package_label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
@@ -79,9 +80,9 @@ jobs:
           echo "automatic_release=$automatic_release" >> "$GITHUB_OUTPUT"
           echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Explain existing release
+      - name: Explain skipped release
         if: github.event_name == 'workflow_run' && steps.version.outputs.automatic_release != 'true'
-        run: echo "Tag ${{ steps.version.outputs.tag }} already exists; no package was published."
+        run: echo "The release tag already exists; no package was published."
 
       - name: Verify basic CI passed
         if: steps.version.outputs.automatic_release == 'true'
@@ -89,15 +90,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET_SHA: ${{ steps.version.outputs.target_sha }}
         run: |
-          conclusion="$(
+          run_id="$(
             gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --workflow ci.yml \
               --commit "$TARGET_SHA" \
               --event push \
               --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // ""'
+          )"
+          if [[ -z "$run_id" ]]; then
+            echo "error: CI run for $TARGET_SHA was not found" >&2
+            exit 1
+          fi
+          echo "Waiting for CI run $run_id for $TARGET_SHA"
+          if ! gh run watch "$run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --compact \
+            --interval 10 \
+            --exit-status; then
+            echo "error: CI run $run_id did not succeed" >&2
+            exit 1
+          fi
+          conclusion="$(
+            gh run view "$run_id" \
+              --repo "$GITHUB_REPOSITORY" \
               --json conclusion \
-              --jq '.[0].conclusion // ""'
+              --jq '.conclusion // ""'
           )"
           if [[ "$conclusion" != "success" ]]; then
             echo "error: CI for $TARGET_SHA did not succeed (conclusion: ${conclusion:-missing})" >&2

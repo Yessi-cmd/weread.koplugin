@@ -26,6 +26,16 @@ end
 
 function PluginUtil.display_error(err)
     local text = tostring(err)
+    local public_account_errors = {
+        mp_credentials_expired = "The public-account credential expired. Scan the WeRead QR code again.",
+        mp_verification_required = "WeRead requires a security verification. Complete it in WeRead or the WeRead web reader, then retry.",
+        mp_risk_controlled = "WeRead temporarily limited public-account requests. Stop retrying for a while, then renew the cookie and try again.",
+    }
+    for token, message in pairs(public_account_errors) do
+        if text:find(token, 1, true) then
+            return I18n.tr(message)
+        end
+    end
     text = text:match("^[^\r\n]+") or text
     if #text > 300 then
         return text:sub(1, 300) .. "..."

@@ -14,7 +14,7 @@ Run these before every PR:
 ```bash
 bash scripts/run_lua_specs.sh
 bash scripts/check_lua_namespace.sh
-luacheck main.lua _meta.lua weread spec
+luacheck main.lua _meta.lua weread integrations spec
 ```
 
 `run_lua_specs.sh` executes every top-level `spec/*_spec.lua` with LuaJIT.

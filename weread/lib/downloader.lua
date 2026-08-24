@@ -15,7 +15,8 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local UIManager = require("ui/uimanager")
 local logger = require("weread.lib.logger")
 local time = require("ui/time")
-local T = require("ffi/util").template
+local ffiutil = require("ffi/util")
+local T = ffiutil.template
 
 local Content = require("weread.lib.content")
 local DownloadDialog = require("weread.ui.download_dialog")
@@ -24,6 +25,10 @@ local I18n = require("weread.lib.i18n")
 local StandbyGuard = require("weread.lib.standby_guard")
 local Thoughts = require("weread.lib.thoughts")
 local WeRead = require("weread.lib.protocol")
+
+local PACKAGE_POLL_SECONDS = 0.25
+-- ui/time.now() is expressed in microseconds.
+local PACKAGE_TIMEOUT_US = 15 * 60 * 1000 * 1000
 
 local function _(text)
     return I18n.tr(text)
@@ -34,6 +39,20 @@ local function css_for_chapter(state, chapter)
         return Content.css_for_chapter(state, chapter)
     end
     return tostring(state and state.css or "")
+end
+
+local function load_chapter_body(source)
+    if type(Content.load_chapter_body) == "function" then
+        return Content.load_chapter_body(source)
+    end
+    return tostring(source or "")
+end
+
+local function replace_chapter_body(source, body)
+    if type(Content.replace_chapter_body) == "function" then
+        return Content.replace_chapter_body(source, body)
+    end
+    return body
 end
 
 local function log_error(err)
@@ -55,6 +74,33 @@ end
 
 local Downloader = {}
 Downloader.__index = Downloader
+
+local function make_package_runner()
+    if type(ffiutil.runInSubProcess) ~= "function"
+        or type(ffiutil.writeToFD) ~= "function"
+        or type(ffiutil.isSubProcessDone) ~= "function"
+        or type(ffiutil.readAllFromFD) ~= "function"
+        or type(ffiutil.terminateSubProcess) ~= "function" then
+        return nil
+    end
+    return {
+        run = function(callback)
+            return ffiutil.runInSubProcess(callback, true)
+        end,
+        write_all = function(fd, data)
+            return ffiutil.writeToFD(fd, data, true)
+        end,
+        is_done = function(pid)
+            return ffiutil.isSubProcessDone(pid)
+        end,
+        read_all = function(fd)
+            return ffiutil.readAllFromFD(fd)
+        end,
+        terminate = function(pid)
+            return ffiutil.terminateSubProcess(pid)
+        end,
+    }
+end
 
 -- o = {
 --   client, settings,                       -- injected dependencies
@@ -246,6 +292,11 @@ function Downloader:_ensureProgressDialog(dl)
             {
                 text = _("Cancel download"),
                 callback = function()
+                    if dl.packaging then
+                        self.show_transient(
+                            _("EPUB packaging is finishing; please wait."), 2)
+                        return
+                    end
                     dl.cancelled = true
                     dl.cancel_reason = dl.cancel_reason or "cancelled"
                     if dl.progress_dialog then
@@ -367,6 +418,7 @@ function Downloader:start(book, chapters, suffix, options)
         bodies = {},
         assets = {},
         assets_by_uid = {},
+        body_bytes = 0,
         state = {},
         total = total,
         failed = {},
@@ -416,7 +468,10 @@ function Downloader:start(book, chapters, suffix, options)
             Content.ensure_reader_state(self.client, book)
             local cache = self.settings.get
                 and self.settings:get("cache", {}) or {}
-            if cache.download_book_images and Content.create_download_workspace then
+            local needs_combined_workspace = not dl.single_chapter
+                and not dl.separate_chapters
+            if (cache.download_book_images or needs_combined_workspace)
+                and Content.create_download_workspace then
                 dl.workspace = Content.create_download_workspace(
                     self.settings, book)
                 dl.state.workspace = dl.workspace
@@ -482,6 +537,133 @@ function Downloader:_perf(dl, stage, started, ...)
     logger.info("download_perf", "stage=", stage,
         "ms=", string.format("%.1f", elapsed),
         "chapter=", tostring(dl.index) .. "/" .. tostring(dl.total), ...)
+end
+
+function Downloader:_prepareCover(dl)
+    if dl.cover_checked then return end
+    dl.cover_checked = true
+    local cover_url = WeRead.normalize_cover_url(dl.book.cover)
+    if not cover_url or cover_url == "" then return end
+    pcall(function()
+        dl.cover_data = self.client:get_binary(cover_url, {
+            max_bytes = Content.MAX_COVER_IMAGE_BYTES,
+        })
+    end)
+end
+
+function Downloader:_hasPackagingSpace(dl)
+    if not dl.workspace or type(Content.available_disk_bytes) ~= "function" then
+        return true
+    end
+    local available = Content.available_disk_bytes(dl.workspace.path)
+    if not available then return true end
+    local estimated_output = (tonumber(dl.body_bytes) or 0)
+        + (tonumber(dl.asset_bytes) or 0)
+        + (type(dl.cover_data) == "string" and #dl.cover_data or 0)
+    local reserve = 32 * 1024 * 1024
+    local required = math.floor(estimated_output * 1.10) + reserve
+    if available < required then
+        return false, T(_(
+            "Not enough free space to build the EPUB. Need about %1 MB more free space."
+        ), tostring(math.max(1,
+            math.ceil((required - available) / (1024 * 1024)))))
+    end
+    return true
+end
+
+function Downloader:_saveCombinedBook(dl)
+    return Content.save_book_epub(
+        self.settings, dl.book, dl.selected, dl.bodies,
+        dl.suffix, dl.assets, dl.state.css, dl.cover_data,
+        dl.state.chapter_css
+    )
+end
+
+-- Compression and archive walking are CPU/disk heavy on older e-ink devices.
+-- Once chapter bodies and images are file-backed, fork only the final combined
+-- EPUB build and poll it from the UI loop. The child returns a tiny status
+-- payload, while the atomic .part commit remains owned by Content.save_book_epub.
+function Downloader:_startPackageJob(dl)
+    local runner = self.package_runner or make_package_runner()
+    if not runner then return false end
+
+    local child = function(_pid, child_write_fd)
+        local ok, value = xpcall(function()
+            return self:_saveCombinedBook(dl)
+        end, debug.traceback)
+        local prefix = ok and "OK" or "ERR"
+        local result = tostring(value or "unknown packaging error")
+        if #result > 2048 then result = result:sub(1, 2045) .. "..." end
+        runner.write_all(child_write_fd,
+            prefix .. "\0" .. result)
+    end
+    local ran, pid, read_fd = pcall(runner.run, child)
+    if not ran or not pid then
+        logger.warn("EPUB packaging subprocess unavailable:",
+            log_error(ran and read_fd or pid))
+        return false
+    end
+
+    dl.packaging = true
+    dl.package_started_at = time.now()
+    local job = {
+        pid = pid,
+        read_fd = read_fd,
+        runner = runner,
+        deadline = time.now() + PACKAGE_TIMEOUT_US,
+    }
+    dl.package_job = job
+    local poll
+    poll = function()
+        if dl.package_job ~= job then return end
+        local checked, done = pcall(runner.is_done, job.pid)
+        if not checked then
+            dl.package_job = nil
+            dl.packaging = false
+            dl.package_result = {
+                ok = false,
+                value = tostring(done or "could not poll EPUB packaging"),
+            }
+            self:_scheduleGuarded(dl, function() self:_step(dl) end)
+            return
+        end
+        if done then
+            local read_ok, payload = true, nil
+            if job.read_fd then
+                read_ok, payload = pcall(runner.read_all, job.read_fd)
+            end
+            job.read_fd = nil
+            dl.package_job = nil
+            dl.packaging = false
+            if not job.terminating then
+                local kind, value
+                if read_ok and type(payload) == "string" then
+                    kind, value = payload:match("^(%u+)%z(.*)$")
+                end
+                dl.package_result = {
+                    ok = kind == "OK",
+                    value = value
+                        or (read_ok and
+                            _("EPUB packaging subprocess returned no result.")
+                            or tostring(payload)),
+                }
+            end
+            self:_scheduleGuarded(dl, function() self:_step(dl) end)
+            return
+        end
+        if time.now() >= job.deadline and not job.terminating then
+            job.terminating = true
+            pcall(runner.terminate, job.pid)
+            dl.package_result = {
+                ok = false,
+                value = _("EPUB packaging timed out."),
+            }
+        end
+        UIManager:scheduleIn(PACKAGE_POLL_SECONDS, poll)
+    end
+    job.poll = poll
+    UIManager:scheduleIn(PACKAGE_POLL_SECONDS, poll)
+    return true
 end
 
 function Downloader:_failChapter(dl, err)
@@ -575,16 +757,33 @@ function Downloader:_footnoteStep(dl)
     self:_setStage(dl,
         T(_("Processing footnotes · chapter %1/%2"),
             tostring(job.index), tostring(#dl.selected)), dl.total)
-    local original = dl.bodies[uid]
+    local body_source = dl.bodies[uid]
+    local original_size = type(body_source) == "table"
+        and tonumber(body_source.size) or nil
     local started = time.now()
-    local ok, transformed, stats = pcall(Footnotes.transform_chapter,
-        original, dl.footnote_scans[uid], job.index_data)
+    local ok, transformed, stats = pcall(function()
+        local original = load_chapter_body(body_source)
+        original_size = original_size or #original
+        return Footnotes.transform_chapter(
+            original, dl.footnote_scans[uid], job.index_data)
+    end)
     if ok then
         local valid, validation_error = Footnotes.validate(transformed)
         if valid then
-            dl.bodies[uid] = transformed
-            add_footnote_stats(dl.footnote_stats, stats)
-            if Footnotes.has_converted(stats) then job.css_needed = true end
+            local stored, replacement = pcall(
+                replace_chapter_body, body_source, transformed)
+            if stored then
+                dl.bodies[uid] = replacement
+                dl.body_bytes = math.max(0,
+                    (tonumber(dl.body_bytes) or 0) - (original_size or 0)
+                        + #transformed)
+                add_footnote_stats(dl.footnote_stats, stats)
+                if Footnotes.has_converted(stats) then job.css_needed = true end
+            else
+                dl.footnote_stats.fallback = dl.footnote_stats.fallback + 1
+                logger.warn("footnote staging failed; keeping original chapter:",
+                    "chapter_uid=", uid, "error=", log_error(replacement))
+            end
         else
             dl.footnote_stats.fallback = dl.footnote_stats.fallback + 1
             logger.warn("footnote transform validation failed; keeping original chapter:",
@@ -662,7 +861,19 @@ function Downloader:_finishChapter(dl)
         error(_("Book images exceed the configured cache safety limit."))
     end
     local uid = tostring(chapter.chapterUid or dl.index)
-    dl.bodies[uid] = xhtml
+    local body_source = xhtml
+    if dl.workspace and not dl.single_chapter and not dl.separate_chapters
+        and type(Content.stage_chapter_body) == "function" then
+        local staged_ok, staged = pcall(
+            Content.stage_chapter_body, dl.workspace, dl.index, xhtml)
+        if not staged_ok then
+            self:_failChapter(dl, staged)
+            return
+        end
+        body_source = staged
+    end
+    dl.bodies[uid] = body_source
+    dl.body_bytes = (tonumber(dl.body_bytes) or 0) + #xhtml
     dl.assets_by_uid = dl.assets_by_uid or {}
     dl.assets_by_uid[uid] = chapter_assets or {}
     table.insert(dl.selected, chapter)
@@ -870,44 +1081,52 @@ function Downloader:_step(dl)
             return
         end
         self:_setStage(dl, _("Building EPUB..."), dl.total)
-        local save_started = time.now()
-        local ok, path, chapter_paths = pcall(function()
-            if dl.single_chapter then
-                local chapter = dl.selected[1]
-                local uid = tostring(chapter.chapterUid or 1)
-                return Content.save_chapter_epub(
-                    self.settings, dl.book, chapter, dl.bodies[uid],
-                    (dl.assets_by_uid and dl.assets_by_uid[uid]) or dl.assets,
-                    css_for_chapter(dl.state, chapter)
-                )
+        local save_started = dl.package_started_at or time.now()
+        local ok, path, chapter_paths
+        if not dl.single_chapter and not dl.separate_chapters then
+            self:_prepareCover(dl)
+            if dl.package_result then
+                ok = dl.package_result.ok == true
+                path = dl.package_result.value
+                dl.package_result = nil
+                dl.package_started_at = nil
+            else
+                local has_space, space_error = self:_hasPackagingSpace(dl)
+                if not has_space then
+                    ok = false
+                    path = space_error
+                elseif self:_startPackageJob(dl) then
+                    return
+                end
             end
-            if dl.separate_chapters then
-                local paths = {}
-                for chapter_index, chapter in ipairs(dl.selected) do
-                    local uid = tostring(chapter.chapterUid or chapter_index)
-                    paths[uid] = Content.save_chapter_epub(
+        end
+        if ok == nil then
+            ok, path, chapter_paths = pcall(function()
+                if dl.single_chapter then
+                    local chapter = dl.selected[1]
+                    local uid = tostring(chapter.chapterUid or 1)
+                    return Content.save_chapter_epub(
                         self.settings, dl.book, chapter, dl.bodies[uid],
-                        (dl.assets_by_uid and dl.assets_by_uid[uid]) or {},
+                        (dl.assets_by_uid and dl.assets_by_uid[uid]) or dl.assets,
                         css_for_chapter(dl.state, chapter)
                     )
                 end
-                return paths[tostring(dl.selected[1].chapterUid or 1)], paths
-            end
-            local cover_data
-            local cover_url = WeRead.normalize_cover_url(dl.book.cover)
-            if cover_url and cover_url ~= "" then
-                pcall(function()
-                    cover_data = self.client:get_binary(cover_url, {
-                        max_bytes = Content.MAX_COVER_IMAGE_BYTES,
-                    })
-                end)
-            end
-            return Content.save_book_epub(
-                self.settings, dl.book, dl.selected, dl.bodies,
-                dl.suffix, dl.assets, dl.state.css, cover_data,
-                dl.state.chapter_css
-            )
-        end)
+                if dl.separate_chapters then
+                    local paths = {}
+                    for chapter_index, chapter in ipairs(dl.selected) do
+                        local uid = tostring(chapter.chapterUid or chapter_index)
+                        paths[uid] = Content.save_chapter_epub(
+                            self.settings, dl.book, chapter, dl.bodies[uid],
+                            (dl.assets_by_uid and dl.assets_by_uid[uid]) or {},
+                            css_for_chapter(dl.state, chapter)
+                        )
+                    end
+                    return paths[tostring(
+                        dl.selected[1].chapterUid or 1)], paths
+                end
+                return self:_saveCombinedBook(dl)
+            end)
+        end
         self:_cleanupWorkspace(dl)
         self:_perf(dl, "save_epub", save_started, "ok=", tostring(ok),
             "single=", tostring(dl.single_chapter))

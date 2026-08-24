@@ -3,7 +3,14 @@ if not ok_json then
     ok_json, json = pcall(require, "rapidjson")
 end
 
+local CacheSafety = require("weread.lib.cache_safety")
+local logger = require("weread.lib.logger")
+
 local BookStore = {}
+BookStore.MAX_METADATA_BYTES = 2 * 1024 * 1024
+BookStore.MAX_READING_STATE_BYTES = 1024 * 1024
+BookStore.MAX_ARTICLES_BYTES = 16 * 1024 * 1024
+local PRESERVED_UNOWNED = "_preserved_unowned"
 
 local reading_fields = {
     app_id = true,
@@ -59,7 +66,8 @@ local function resolved_dir(settings, book_id, book)
             if dir then break end
         end
     end
-    return dir or (settings.cache_dir .. "/" .. basename_safe(book_id))
+    local root = tostring(settings.cache_dir or ""):gsub("/+$", "")
+    return dir or (root .. "/" .. basename_safe(book_id))
 end
 
 local function encode(value)
@@ -82,13 +90,25 @@ local function decode(value)
     return json:decode(value)
 end
 
-local function read_json(path)
+local function read_json(path, max_bytes)
     local file = io.open(path, "rb")
     if not file then return nil end
+    local size, size_err = file:seek("end")
+    if not size or size > max_bytes then
+        file:close()
+        return nil, size_err or "file exceeds cache size limit"
+    end
+    local rewound, rewind_err = file:seek("set", 0)
+    if not rewound then
+        file:close()
+        return nil, rewind_err or "could not rewind cache file"
+    end
     local content = file:read("*a")
     file:close()
+    if not content then return nil, "could not read cache file" end
     local ok, value = pcall(decode, content)
-    return ok and type(value) == "table" and value or nil
+    if ok and type(value) == "table" then return value end
+    return nil, "invalid cache JSON"
 end
 
 local function write_json(path, value)
@@ -98,10 +118,10 @@ local function write_json(path, value)
     local file, err = io.open(tmp_path, "wb")
     if not file then return false, err end
     local write_ok, write_err = file:write(content)
-    file:close()
-    if not write_ok then
+    local close_ok, close_err = file:close()
+    if not write_ok or not close_ok then
         os.remove(tmp_path)
-        return false, write_err
+        return false, write_err or close_err
     end
     local rename_ok, rename_err = os.rename(tmp_path, path)
     if not rename_ok then
@@ -112,7 +132,7 @@ local function write_json(path, value)
 end
 
 local function merge(target, source)
-    for key, value in pairs(source or {}) do
+    for key, value in pairs(type(source) == "table" and source or {}) do
         target[key] = value
     end
 end
@@ -123,22 +143,68 @@ end
 
 function BookStore.load(settings, book_id, index)
     local book = {}
+    if type(index) == "table" then merge(book, index[PRESERVED_UNOWNED]) end
     merge(book, index)
+    book[PRESERVED_UNOWNED] = nil
     local dir = resolved_dir(settings, book_id, index)
-    merge(book, read_json(dir .. "/metadata.json"))
-    merge(book, read_json(dir .. "/reading_state.json"))
-    merge(book, read_json(dir .. "/articles.json"))
-    book.book_id = book.book_id or book.bookId or tostring(book_id)
+    local owner = tostring(book_id)
+    local valid = CacheSafety.validate_owned(dir, owner, {
+        roots = { settings.cache_dir, settings.default_cache_dir },
+        legacy_evidence = CacheSafety.has_legacy_file_evidence(dir, book),
+    })
+    if valid then
+        for _, cache in ipairs({
+            { "metadata.json", BookStore.MAX_METADATA_BYTES },
+            { "reading_state.json", BookStore.MAX_READING_STATE_BYTES },
+            { "articles.json", BookStore.MAX_ARTICLES_BYTES },
+        }) do
+            local value, read_err = read_json(dir .. "/" .. cache[1], cache[2])
+            merge(book, value)
+            if read_err then
+                logger.warn("ignore invalid book cache:", cache[1],
+                    tostring(read_err))
+            end
+        end
+    end
+    book.book_id = owner
     book.cache_dir = dir
     return book
 end
 
-function BookStore.save(settings, book_id, book)
+function BookStore.save(settings, book_id, book, options)
+    options = options or {}
     book = type(book) == "table" and book or {}
     local dir = resolved_dir(settings, book_id, book)
-    os.execute("mkdir -p " .. string.format("%q", dir))
+    local owner = tostring(book_id)
+    local roots = { settings.cache_dir, settings.default_cache_dir }
+    local valid, validation_error = CacheSafety.validate_owned(dir, owner, {
+        roots = roots,
+        allow_new_child = true,
+        legacy_evidence = CacheSafety.has_legacy_file_evidence(dir, book),
+    })
+    if not valid then
+        if options.preserve_unowned_index then
+            local preserved = { book_id = owner }
+            for key, value in pairs(book) do
+                if key ~= "chapters" and key ~= "cache_dir"
+                    and key ~= "bookId" and key ~= "book_id" then
+                    preserved[key] = value
+                end
+            end
+            return true, {
+                cache_dir = dir,
+                [PRESERVED_UNOWNED] = preserved,
+            }, validation_error
+        end
+        return false, validation_error
+    end
 
-    local metadata = { book_id = book.book_id or book.bookId or tostring(book_id) }
+    local made, make_err = CacheSafety.make_path(dir)
+    if not made then return false, make_err end
+    local marked, mark_err = CacheSafety.mark(dir, owner)
+    if not marked then return false, mark_err end
+
+    local metadata = { book_id = owner }
     local reading_state = {}
     local articles = {}
     for key, value in pairs(book) do
@@ -146,7 +212,8 @@ function BookStore.save(settings, book_id, book)
             articles[key] = value
         elseif reading_fields[key] then
             reading_state[key] = value
-        elseif key ~= "chapters" and key ~= "cache_dir" and key ~= "bookId" then
+        elseif key ~= "chapters" and key ~= "cache_dir"
+            and key ~= "bookId" and key ~= "book_id" then
             metadata[key] = value
         end
     end
@@ -172,8 +239,12 @@ function BookStore.is_minimal_index(books)
     for _book_id, record in pairs(books or {}) do
         if type(record) ~= "table" then return false end
         for key in pairs(record) do
-            if key ~= "cache_dir" then return false end
+            if key ~= "cache_dir" and key ~= PRESERVED_UNOWNED then
+                return false
+            end
         end
+        if record[PRESERVED_UNOWNED] ~= nil
+            and type(record[PRESERVED_UNOWNED]) ~= "table" then return false end
     end
     return true
 end

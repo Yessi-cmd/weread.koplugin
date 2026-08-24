@@ -29,36 +29,37 @@ expect(BookLayout.compose_css("body{}", "smart")
         :find("margin: 2.5em 0 5em", 1, true),
     "smart mode did not add adaptive chapter-opening whitespace")
 
-local existing_body, _existing_kind, existing_added = BookLayout.prepare_body(
+local existing_body, existing_kind, existing_added = BookLayout.prepare_body(
     "<h2>第 10 章</h2><p>老师本该对我垂以训诫。</p>",
     { title = "第10章", level = 2 }, "smart")
-expect(not existing_added
+expect(existing_kind == "text" and not existing_added
         and existing_body:find("<h2>第 10 章</h2>", 1, true),
     "smart mode duplicated an existing visible title")
 expect(not BookLayout.has_visible_title(
         "<html><head><title>第10章</title></head><body><p>正文</p></body></html>",
         "第10章"),
     "head metadata was mistaken for a visible title")
-local shell_body, _shell_kind, shell_added = BookLayout.prepare_body(
+local shell_body, shell_kind, shell_added = BookLayout.prepare_body(
     '<div class="reader-title-shell">第10章</div><p>正文</p>',
     { title = "第10章", level = 1 }, "smart")
-expect(shell_added and shell_body:find(
+expect(shell_kind == "text" and shell_added and shell_body:find(
         '<header class="wr-generated-chapter-heading">', 1, true),
     "a non-semantic title shell suppressed the generated chapter title")
-local hidden_heading_body, _hidden_kind, hidden_heading_added =
+local hidden_heading_body, hidden_kind, hidden_heading_added =
     BookLayout.prepare_body(
         '<h1 style="display:none">第10章</h1><p>正文</p>',
         { title = "第10章", level = 1 }, "smart")
-expect(hidden_heading_added
+expect(hidden_kind == "text" and hidden_heading_added
         and select(2, hidden_heading_body:gsub(">第10章</h1>", "")) == 2,
     "a hidden semantic heading suppressed the visible generated title")
 expect(BookLayout.compose_css("header{display:none!important}", "smart")
         :find("display: block !important", 1, true),
     "generated chapter heading was not protected from source CSS")
 
-local original_body, _original_kind, original_added = BookLayout.prepare_body(
+local original_body, original_kind, original_added = BookLayout.prepare_body(
     "<p>正文</p>", { title = "章节标题" }, "original")
-expect(not original_added and original_body == "<p>正文</p>",
+expect(original_kind == "text" and not original_added
+        and original_body == "<p>正文</p>",
     "original mode changed chapter markup")
 local image_body, image_kind, image_added = BookLayout.prepare_body(
     "<img src='page.jpg'/>", { title = "插图" }, "smart")

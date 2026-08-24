@@ -157,7 +157,7 @@ Before submitting a PR, run the relevant checks if possible:
 ```bash
 bash scripts/run_lua_specs.sh
 bash scripts/check_lua_namespace.sh
-luacheck main.lua _meta.lua weread spec
+luacheck main.lua _meta.lua weread integrations spec
 python3 -m py_compile scripts/*.py
 bash scripts/package_release.sh /tmp/weread.koplugin-release-test.zip
 rg -n -P "wrk-(?!x{8,})[A-Za-z0-9_-]{12,}|(wr_skey|wr_rt|wr_vid|ptcz)=((?!XXX)[^;[:space:]'\''\"]{8,})|x-wrpa-[0-9]+:\s*((?!\.\.\.)[A-Za-z0-9+/=_-]{12,})|thirdwx[=:]\s*[A-Za-z0-9_-]{8,}" . --glob '!cache/**' --glob '!*.epub'
@@ -168,7 +168,7 @@ rg -n -P "wrk-(?!x{8,})[A-Za-z0-9_-]{12,}|(wr_skey|wr_rt|wr_vid|ptcz)=((?!XXX)[^
 ```bash
 bash scripts/run_lua_specs.sh
 bash scripts/check_lua_namespace.sh
-luacheck main.lua _meta.lua weread spec
+luacheck main.lua _meta.lua weread integrations spec
 python3 -m py_compile scripts/*.py
 bash scripts/package_release.sh /tmp/weread.koplugin-release-test.zip
 rg -n -P "wrk-(?!x{8,})[A-Za-z0-9_-]{12,}|(wr_skey|wr_rt|wr_vid|ptcz)=((?!XXX)[^;[:space:]'\''\"]{8,})|x-wrpa-[0-9]+:\s*((?!\.\.\.)[A-Za-z0-9+/=_-]{12,})|thirdwx[=:]\s*[A-Za-z0-9_-]{8,}" . --glob '!cache/**' --glob '!*.epub'

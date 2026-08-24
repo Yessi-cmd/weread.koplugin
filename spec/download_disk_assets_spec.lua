@@ -12,7 +12,9 @@ end
 package.preload["bit"] = function()
     return { rshift = function(value, bits) return math.floor(value / 2 ^ bits) end }
 end
-package.preload["weread.lib.crypto"] = function() return {} end
+package.preload["weread.lib.crypto"] = function()
+    return { md5_hex = function() return string.rep("a", 32) end }
+end
 package.preload["weread.lib.reader_state"] = function() return {} end
 package.preload["weread.lib.protocol"] = function()
     return {
@@ -116,13 +118,23 @@ local Content = require("weread.lib.content")
 local root = os.tmpname()
 os.remove(root)
 assert(os.execute("mkdir -p " .. string.format("%q", root)))
+local book_dir = root .. "/book"
+assert(os.execute("mkdir -p " .. string.format("%q", book_dir)))
+assert(require("weread.lib.cache_safety").mark(book_dir, "book"))
 local workspace = {
-    path = root .. "/.weread-download-100-123456",
+    path = book_dir .. "/.weread-download-100-123456",
 }
 workspace.incoming_dir = workspace.path .. "/incoming"
 workspace.asset_dir = workspace.path .. "/images"
+workspace.body_dir = workspace.path .. "/bodies"
+workspace.package_text_dir = workspace.path .. "/package-text"
 assert(os.execute("mkdir -p " .. string.format("%q", workspace.incoming_dir)))
 assert(os.execute("mkdir -p " .. string.format("%q", workspace.asset_dir)))
+assert(os.execute("mkdir -p " .. string.format("%q", workspace.body_dir)))
+assert(os.execute("mkdir -p " .. string.format("%q", workspace.package_text_dir)))
+local available_disk = Content.available_disk_bytes(workspace.path)
+expect(type(available_disk) == "number" and available_disk > 0,
+    "free-space preflight could not inspect the download filesystem")
 
 local function tar_header(name, size)
     local header = name .. string.rep("\0", 100 - #name)
@@ -196,7 +208,7 @@ local settings = {
     cache_dir = root,
     get = function(_self, _key, default) return default end,
 }
-local book = { book_id = "book", title = "Disk Assets", cache_dir = root }
+local book = { book_id = "book", title = "Disk Assets", cache_dir = book_dir }
 local output = Content.save_book_epub(settings, book,
     { { chapterUid = 7, title = "Chapter" } },
     { ["7"] = "<p>body</p>" }, "book", assets, "body{}")
@@ -215,6 +227,52 @@ expect(used_path and path_calls == 1,
     "EPUB writer did not stream the staged image directory with one addPath")
 expect(io.open(output .. ".part", "rb") == nil,
     "successful EPUB build left a partial archive")
+
+local long_name = Content.filename_safe(string.rep("超长书名", 100))
+expect(#long_name <= 180 and long_name:match("%-aaaaaaaaaa$"),
+    "long filenames were not safely shortened with a stable suffix")
+
+local staged_chapters = {}
+local staged_bodies = {}
+for index = 1, 40 do
+    local uid = tostring(1000 + index)
+    staged_chapters[index] = {
+        chapterUid = uid,
+        chapterIdx = index,
+        title = "Staged " .. tostring(index),
+    }
+    staged_bodies[uid] = Content.stage_chapter_body(
+        workspace, index, "<p>" .. string.rep("正文", 64 * 1024) .. "</p>")
+end
+collectgarbage("collect")
+local staged_before_kb = collectgarbage("count")
+archive_calls = {}
+Content.save_book_epub(settings, book, staged_chapters, staged_bodies,
+    "staged", {}, "body{}")
+collectgarbage("collect")
+local staged_after_kb = collectgarbage("count")
+local streamed_text_tree = false
+local in_memory_chapters = 0
+for _, call in ipairs(archive_calls) do
+    if call.kind == "path" and call.name == "OEBPS/text" then
+        streamed_text_tree = call.path == workspace.package_text_dir
+            and call.recursive == true
+    elseif call.kind == "memory"
+        and call.name:match("OEBPS/text/chapter%-%d+%.xhtml$") then
+        in_memory_chapters = in_memory_chapters + 1
+    end
+end
+expect(streamed_text_tree and in_memory_chapters == 0,
+    "staged chapter bodies were not streamed as one directory tree")
+expect(staged_after_kb - staged_before_kb < 2048,
+    "EPUB assembly retained all staged chapter bodies in Lua memory")
+local packaged_chapter = assert(io.open(
+    workspace.package_text_dir .. "/chapter-040.xhtml", "rb"))
+local packaged_text = packaged_chapter:read("*a")
+packaged_chapter:close()
+expect(packaged_text:find("Staged 40", 1, true)
+        and packaged_text:find("正文", 1, true),
+    "staged chapter wrapper was not written correctly")
 
 Content.save_book_epub(settings, book, {
     { chapterUid = 1, title = "One" },
@@ -290,22 +348,22 @@ old:close()
 expect(io.open(output .. ".part", "rb") == nil,
     "failed EPUB build left a partial archive")
 
-local stale = root .. "/.weread-download-200-654321"
+local stale = book_dir .. "/.weread-download-200-654321"
 assert(os.execute("mkdir -p " .. string.format("%q", stale)))
-local orphan = assert(io.open(root .. "/orphan.epub.part", "wb"))
+local orphan = assert(io.open(book_dir .. "/orphan.epub.part", "wb"))
 orphan:write("partial")
 orphan:close()
 local recovery_settings = {
     cache_dir = root,
     get = function(_self, key, default)
         if key == "books" then
-            return { book = { book_id = "book", cache_dir = root } }
+            return { book = { book_id = "book", cache_dir = book_dir } }
         end
         return default
     end,
 }
 local removed = Content.cleanup_stale_downloads(recovery_settings)
-expect(removed == 3 and io.open(root .. "/orphan.epub.part", "rb") == nil,
+expect(removed == 3 and io.open(book_dir .. "/orphan.epub.part", "rb") == nil,
     "startup recovery did not remove stale workspace and partial EPUB: "
         .. tostring(removed))
 

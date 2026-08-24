@@ -116,6 +116,7 @@ test("unverified position blocks reading-time reporting", function()
     local proceed = report:_precheck()
     eq(proceed, false, "precheck blocked")
     eq(report:status().state, "waiting_for_progress", "waiting state")
+    eq(report:status().wait_reason, "progress_unverified", "waiting reason")
 end)
 
 test("verified live position passes the reporting gate", function()

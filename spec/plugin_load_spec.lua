@@ -74,6 +74,7 @@ local menu_registered = false
 local bookshelf_opened = false
 local backup_cleaned = false
 local auto_check_scheduled = false
+local updater_repository
 
 package.preload["weread.lib.client"] = function()
     return { new = function(_self, settings) return { settings = settings } end }
@@ -87,6 +88,7 @@ end
 package.preload["weread.lib.updater"] = function()
     return {
         new = function(_self, options)
+            updater_repository = options.repository
             options.cleanup_backup = function()
                 backup_cleaned = true
                 return true
@@ -219,8 +221,10 @@ expect(dispatcher_registered, "dispatcher actions were not registered")
 expect(menu_registered, "plugin was not registered in KOReader's main menu")
 expect(backup_cleaned,
     "successful plugin initialization did not clean the update backup")
-expect(not auto_check_scheduled,
-    "private build scheduled a public upstream update check")
+expect(updater_repository == "Yessi-cmd/weread.koplugin",
+    "private build did not use its isolated update repository")
+expect(auto_check_scheduled,
+    "private release channel did not schedule its enabled update check")
 expect(plugin:launch() == true and bookshelf_opened,
     "standard third-party launcher entry did not open the bookshelf")
 expect(type(plugin.openBookshelf) == "function",
