@@ -95,7 +95,6 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --workflow ci.yml \
               --commit "$TARGET_SHA" \
-              --event push \
               --limit 1 \
               --json databaseId \
               --jq '.[0].databaseId // ""'

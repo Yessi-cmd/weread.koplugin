@@ -46,7 +46,8 @@ To publish a release:
 3. Commit and push the change to `main`.
 4. The normal `CI` and pinned KOReader integration workflows run.
 5. After the KOReader integration succeeds, the `Release` workflow confirms
-   that normal CI also passed for the same commit.
+   that CI also passed for the same commit. A manually dispatched CI run is
+   accepted as a recovery path when GitHub misses a fork push trigger.
 6. If `vX.Y.Z` does not already exist, it creates the package, checksum, tag,
    and GitHub Release.
 
