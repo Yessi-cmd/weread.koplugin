@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       package_label:
-        description: Optional package label; defaults to the first 8 characters of the commit ID
+        description: Optional preview label; defaults to the first 8 characters of the commit ID
         required: false
         type: string
+      publish_release:
+        description: Publish the current untagged version after verifying CI and KOReader integration
+        required: false
+        default: false
+        type: boolean
   workflow_run:
     workflows:
       - KOReader integration
@@ -43,6 +48,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           MANUAL_LABEL: ${{ inputs.package_label }}
+          MANUAL_PUBLISH: ${{ inputs.publish_release }}
           TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
           set -euo pipefail
@@ -63,6 +69,12 @@ jobs:
           package_label="$tag"
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
             automatic_release="$(bash scripts/should_auto_release.sh "$current")"
+          elif [[ "$MANUAL_PUBLISH" == "true" ]]; then
+            automatic_release="$(bash scripts/should_auto_release.sh "$current")"
+            if [[ "$automatic_release" != "true" ]]; then
+              echo "error: tag $tag already exists; bump to a new version" >&2
+              exit 1
+            fi
           else
             package_label="${MANUAL_LABEL:-${TARGET_SHA:0:8}}"
             if [[ ! "$package_label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
@@ -120,6 +132,45 @@ jobs:
           )"
           if [[ "$conclusion" != "success" ]]; then
             echo "error: CI for $TARGET_SHA did not succeed (conclusion: ${conclusion:-missing})" >&2
+            exit 1
+          fi
+
+      - name: Verify KOReader integration passed
+        if: github.event_name == 'workflow_dispatch' && steps.version.outputs.automatic_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.version.outputs.target_sha }}
+        run: |
+          run_id="$(
+            gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow koreader-integration.yml \
+              --commit "$TARGET_SHA" \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // ""'
+          )"
+          if [[ -z "$run_id" ]]; then
+            echo "error: KOReader integration run for $TARGET_SHA was not found" >&2
+            exit 1
+          fi
+          echo "Waiting for KOReader integration run $run_id for $TARGET_SHA"
+          if ! gh run watch "$run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --compact \
+            --interval 10 \
+            --exit-status; then
+            echo "error: KOReader integration run $run_id did not succeed" >&2
+            exit 1
+          fi
+          conclusion="$(
+            gh run view "$run_id" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json conclusion \
+              --jq '.conclusion // ""'
+          )"
+          if [[ "$conclusion" != "success" ]]; then
+            echo "error: KOReader integration for $TARGET_SHA did not succeed (conclusion: ${conclusion:-missing})" >&2
             exit 1
           fi
 

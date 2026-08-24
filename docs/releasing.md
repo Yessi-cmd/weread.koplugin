@@ -33,7 +33,12 @@ controls the filename:
 
 A manual run validates matching versions and Changelog metadata, builds the zip and SHA-256
 checksum, and uploads them as two separate workflow artifacts retained for 14
-days. It does not create a tag or GitHub Release.
+days. By default it does not create a tag or GitHub Release.
+
+If a fork does not deliver the push or `workflow_run` event, first manually run
+`CI` and `KOReader integration` on `main`, then dispatch `Release` with
+`publish_release` enabled. The workflow verifies both runs belong to the same
+commit and succeeded before it creates the still-untagged version's Release.
 
 ## Automatic release / 自动发布
 
